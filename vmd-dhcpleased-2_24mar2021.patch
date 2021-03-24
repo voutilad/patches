@@ -1,0 +1,317 @@
+Index: config.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/config.c,v
+retrieving revision 1.60
+diff -u -p -r1.60 config.c
+--- config.c	19 Mar 2021 09:29:33 -0000	1.60
++++ config.c	24 Mar 2021 15:42:13 -0000
+@@ -227,6 +227,7 @@ config_setvm(struct privsep *ps, struct 
+ 	char			 base[PATH_MAX];
+ 	unsigned int		 unit;
+ 	struct timeval		 tv, rate, since_last;
++	struct vmop_addr_req	 var;
+ 
+ 	errno = 0;
+ 
+@@ -499,6 +500,12 @@ config_setvm(struct privsep *ps, struct 
+ 		proc_compose_imsg(ps, PROC_VMM, -1,
+ 		    IMSG_VMDOP_START_VM_IF, vm->vm_vmid, tapfds[i],
+ 		    &i, sizeof(i));
++
++		memset(&var, 0, sizeof(var));
++		var.var_vmid = vm->vm_vmid;
++		var.var_nic_idx = i;
++		proc_compose_imsg(ps, PROC_PRIV, -1, IMSG_VMDOP_PRIV_GET_ADDR,
++		    vm->vm_vmid, dup(tapfds[i]), &var, sizeof(var));
+ 	}
+ 
+ 	if (!(vm->vm_state & VM_STATE_RECEIVED))
+Index: dhcp.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/dhcp.c,v
+retrieving revision 1.8
+diff -u -p -r1.8 dhcp.c
+--- dhcp.c	27 Dec 2018 19:51:30 -0000	1.8
++++ dhcp.c	24 Mar 2021 15:42:13 -0000
+@@ -57,8 +57,11 @@ dhcp_request(struct vionet_dev *dev, cha
+ 	if ((offset = decode_hw_header(buf, buflen, 0, &pc, HTYPE_ETHER)) < 0)
+ 		return (-1);
+ 
+-	if (memcmp(pc.pc_smac, dev->mac, ETHER_ADDR_LEN) != 0 ||
+-	    memcmp(pc.pc_dmac, broadcast, ETHER_ADDR_LEN) != 0)
++	if (memcmp(pc.pc_dmac, broadcast, ETHER_ADDR_LEN) != 0 &&
++	    memcmp(pc.pc_dmac, dev->hostmac, ETHER_ADDR_LEN) != 0)
++		return (-1);
++
++	if (memcmp(pc.pc_smac, dev->mac, ETHER_ADDR_LEN) != 0)
+ 		return (-1);
+ 
+ 	if ((offset = decode_udp_ip_header(buf, buflen, offset, &pc)) < 0)
+Index: priv.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/priv.c,v
+retrieving revision 1.16
+diff -u -p -r1.16 priv.c
+--- priv.c	28 Feb 2021 22:56:09 -0000	1.16
++++ priv.c	24 Mar 2021 15:42:14 -0000
+@@ -92,6 +92,8 @@ priv_dispatch_parent(int fd, struct priv
+ 	struct ifaliasreq	 ifra;
+ 	struct in6_aliasreq	 in6_ifra;
+ 	struct if_afreq		 ifar;
++	struct vmop_addr_req	 vareq;
++	struct vmop_addr_result	 varesult;
+ 	char			 type[IF_NAMESIZE];
+ 
+ 	switch (imsg->hdr.type) {
+@@ -115,6 +117,7 @@ priv_dispatch_parent(int fd, struct priv
+ 		break;
+ 	case IMSG_VMDOP_CONFIG:
+ 	case IMSG_CTL_RESET:
++	case IMSG_VMDOP_PRIV_GET_ADDR:
+ 		break;
+ 	default:
+ 		return (-1);
+@@ -244,6 +247,22 @@ priv_dispatch_parent(int fd, struct priv
+ 
+ 		if (ioctl(env->vmd_fd6, SIOCAIFADDR_IN6, &in6_ifra) == -1)
+ 			log_warn("SIOCAIFADDR_IN6");
++		break;
++	case IMSG_VMDOP_PRIV_GET_ADDR:
++		IMSG_SIZE_CHECK(imsg, &vareq);
++		memcpy(&vareq, imsg->data, sizeof(vareq));
++
++		varesult.var_vmid = vareq.var_vmid;
++		varesult.var_nic_idx = vareq.var_nic_idx;
++
++		/* resolve lladdr for the tap(4) and send back to parent */
++		if (ioctl(imsg->fd, SIOCGIFADDR, &varesult.var_addr) != 0)
++			log_warn("SIOCGIFADDR");
++		else
++			proc_compose_imsg(ps, PROC_PARENT, -1,
++			    IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE, imsg->hdr.peerid,
++			    -1, &varesult, sizeof(varesult));
++		close(imsg->fd);
+ 		break;
+ 	case IMSG_VMDOP_CONFIG:
+ 		config_getconfig(env, imsg);
+Index: virtio.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/virtio.c,v
+retrieving revision 1.82
+diff -u -p -r1.82 virtio.c
+--- virtio.c	11 Dec 2019 06:45:16 -0000	1.82
++++ virtio.c	24 Mar 2021 15:42:14 -0000
+@@ -1510,7 +1510,7 @@ vionet_notify_tx(struct vionet_dev *dev)
+ 			log_debug("vionet: wrong source address %s for vm %d",
+ 			    ether_ntoa((struct ether_addr *)
+ 			    eh->ether_shost), dev->vm_id);
+-		else if (dev->local && dhcpsz == 0 &&
++		else if (dev->local &&
+ 		    (dhcpsz = dhcp_request(dev, pkt, pktsz, &dhcppkt)) != -1) {
+ 			log_debug("vionet: dhcp request,"
+ 			    " local response size %zd", dhcpsz);
+@@ -2033,6 +2033,32 @@ virtio_init(struct vmd_vm *vm, int child
+ 	vmmci.pci_id = id;
+ 
+ 	evtimer_set(&vmmci.timeout, vmmci_timeout, NULL);
++}
++
++/*
++ * vionet_set_hostmac
++ *
++ * Sets the hardware address for the host-side tap(4) on a vionet_dev.
++ *
++ * This should only be called from the event-loop thread
++ *
++ * vm: pointer to the current vmd_vm instance
++ * idx: index into the array of vionet_dev's for the target vionet_dev
++ * addr: ethernet address to set
++ */
++void
++vionet_set_hostmac(struct vmd_vm *vm, unsigned int idx,
++    uint8_t addr[ETHER_ADDR_LEN])
++{
++	struct vmop_create_params *vmc = &vm->vm_params;
++	struct vm_create_params	  *vcp = &vmc->vmc_params;
++	struct vionet_dev	  *dev;
++
++	if (idx > vcp->vcp_nnics)
++		fatalx("vionet_set_hostmac");
++
++	dev = &vionet[idx];
++	memcpy(dev->hostmac, addr, sizeof(dev->hostmac));
+ }
+ 
+ void
+Index: virtio.h
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/virtio.h,v
+retrieving revision 1.36
+diff -u -p -r1.36 virtio.h
+--- virtio.h	7 Jan 2021 17:11:38 -0000	1.36
++++ virtio.h	24 Mar 2021 15:42:14 -0000
+@@ -208,6 +208,7 @@ struct vionet_dev {
+ 	uint32_t vm_vmid;
+ 	int irq;
+ 	uint8_t mac[6];
++	uint8_t hostmac[6];
+ 
+ 	int idx;
+ 	int lockedmac;
+@@ -298,6 +299,7 @@ void vionet_notify_rx(struct vionet_dev 
+ int vionet_notify_tx(struct vionet_dev *);
+ void vionet_process_rx(uint32_t);
+ int vionet_enq_rx(struct vionet_dev *, char *, ssize_t, int *);
++void vionet_set_hostmac(struct vmd_vm *, unsigned int, uint8_t[ETHER_ADDR_LEN]);
+ 
+ int vmmci_io(int, uint16_t, uint32_t *, uint8_t *, void *, uint8_t);
+ int vmmci_dump(int);
+Index: vm.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vm.c,v
+retrieving revision 1.60
+diff -u -p -r1.60 vm.c
+--- vm.c	19 Mar 2021 09:29:33 -0000	1.60
++++ vm.c	24 Mar 2021 15:42:14 -0000
+@@ -394,6 +394,7 @@ vm_dispatch_vmm(int fd, short event, voi
+ {
+ 	struct vmd_vm		*vm = arg;
+ 	struct vmop_result	 vmr;
++	struct vmop_addr_result	 var;
+ 	struct imsgev		*iev = &vm->vm_iev;
+ 	struct imsgbuf		*ibuf = &iev->ibuf;
+ 	struct imsg		 imsg;
+@@ -470,6 +471,16 @@ vm_dispatch_vmm(int fd, short event, voi
+ 				imsg_flush(&current_vm->vm_iev.ibuf);
+ 				_exit(0);
+ 			}
++			break;
++		case IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE:
++			IMSG_SIZE_CHECK(&imsg, &var);
++			memcpy(&var, imsg.data, sizeof(var));
++
++			log_debug("%s: received tap addr %s for nic %d",
++			    vm->vm_params.vmc_params.vcp_name,
++			    ether_ntoa((void *)var.var_addr), var.var_nic_idx);
++
++			vionet_set_hostmac(vm, var.var_nic_idx, var.var_addr);
+ 			break;
+ 		default:
+ 			fatalx("%s: got invalid imsg %d from %s",
+Index: vmd.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vmd.c,v
+retrieving revision 1.120
+diff -u -p -r1.120 vmd.c
+--- vmd.c	27 Jan 2021 07:21:54 -0000	1.120
++++ vmd.c	24 Mar 2021 15:42:14 -0000
+@@ -58,6 +58,7 @@ void	 vmd_shutdown(void);
+ int	 vmd_control_run(void);
+ int	 vmd_dispatch_control(int, struct privsep_proc *, struct imsg *);
+ int	 vmd_dispatch_vmm(int, struct privsep_proc *, struct imsg *);
++int	 vmd_dispatch_priv(int, struct privsep_proc *, struct imsg *);
+ int	 vmd_check_vmh(struct vm_dump_header *);
+ 
+ int	 vm_instance(struct privsep *, struct vmd_vm **,
+@@ -70,7 +71,7 @@ struct vmd	*env;
+ 
+ static struct privsep_proc procs[] = {
+ 	/* Keep "priv" on top as procs[0] */
+-	{ "priv",	PROC_PRIV,	NULL, priv },
++	{ "priv",	PROC_PRIV,	vmd_dispatch_priv, priv },
+ 	{ "control",	PROC_CONTROL,	vmd_dispatch_control, control },
+ 	{ "vmm",	PROC_VMM,	vmd_dispatch_vmm, vmm, vmm_shutdown },
+ };
+@@ -542,6 +543,24 @@ vmd_dispatch_vmm(int fd, struct privsep_
+ 		}
+ 		IMSG_SIZE_CHECK(imsg, &res);
+ 		proc_forward_imsg(ps, imsg, PROC_CONTROL, -1);
++		break;
++	default:
++		return (-1);
++	}
++
++	return (0);
++}
++
++int
++vmd_dispatch_priv(int fd, struct privsep_proc *p, struct imsg *imsg)
++{
++	struct vmop_addr_result	 var;
++
++	switch (imsg->hdr.type) {
++	case IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE:
++		IMSG_SIZE_CHECK(imsg, &var);
++		memcpy(&var, imsg->data, sizeof(var));
++		proc_forward_imsg(p->p_ps, imsg, PROC_VMM, -1);
+ 		break;
+ 	default:
+ 		return (-1);
+Index: vmd.h
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vmd.h,v
+retrieving revision 1.102
+diff -u -p -r1.102 vmd.h
+--- vmd.h	19 Mar 2021 09:29:33 -0000	1.102
++++ vmd.h	24 Mar 2021 15:42:14 -0000
+@@ -120,6 +120,8 @@ enum imsg_type {
+ 	IMSG_VMDOP_PRIV_IFADDR,
+ 	IMSG_VMDOP_PRIV_IFADDR6,
+ 	IMSG_VMDOP_PRIV_IFRDOMAIN,
++	IMSG_VMDOP_PRIV_GET_ADDR,
++	IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE,
+ 	IMSG_VMDOP_VM_SHUTDOWN,
+ 	IMSG_VMDOP_VM_REBOOT,
+ 	IMSG_VMDOP_CONFIG,
+@@ -156,6 +158,17 @@ struct vmop_ifreq {
+ 	char				 vfr_value[VM_NAME_MAX];
+ 	struct sockaddr_storage		 vfr_addr;
+ 	struct sockaddr_storage		 vfr_mask;
++};
++
++struct vmop_addr_req {
++	uint32_t		 var_vmid;
++	unsigned int		 var_nic_idx;
++};
++
++struct vmop_addr_result {
++	uint32_t		 var_vmid;
++	unsigned int		 var_nic_idx;
++	uint8_t			 var_addr[ETHER_ADDR_LEN];
+ };
+ 
+ struct vmop_owner {
+Index: vmm.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vmm.c,v
+retrieving revision 1.97
+diff -u -p -r1.97 vmm.c
+--- vmm.c	2 Mar 2021 02:56:22 -0000	1.97
++++ vmm.c	24 Mar 2021 15:42:14 -0000
+@@ -109,6 +109,7 @@ vmm_dispatch_parent(int fd, struct privs
+ 	struct vmop_id		 vid;
+ 	struct vmop_result	 vmr;
+ 	struct vmop_create_params vmc;
++	struct vmop_addr_result  var;
+ 	uint32_t		 id = 0, peerid = imsg->hdr.peerid;
+ 	pid_t			 pid = 0;
+ 	unsigned int		 mode, flags;
+@@ -331,6 +332,18 @@ vmm_dispatch_parent(int fd, struct privs
+ 		if ((id = vm_id2vmid(id, NULL)) == 0)
+ 			res = ENOENT;
+ 		cmd = IMSG_VMDOP_START_VM_RESPONSE;
++		break;
++	case IMSG_VMDOP_PRIV_GET_ADDR_RESPONSE:
++		IMSG_SIZE_CHECK(imsg, &var);
++		memcpy(&var, imsg->data, sizeof(var));
++		if ((vm = vm_getbyvmid(var.var_vmid)) == NULL) {
++			res = ENOENT;
++			break;
++		}
++		/* Forward hardware address details to the guest vm */
++		imsg_compose_event(&vm->vm_iev,
++		    imsg->hdr.type, imsg->hdr.peerid, imsg->hdr.pid,
++		    imsg->fd, &var, sizeof(var));
+ 		break;
+ 	default:
+ 		return (-1);

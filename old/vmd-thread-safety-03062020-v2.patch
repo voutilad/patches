@@ -1,0 +1,882 @@
+Index: control.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/control.c,v
+retrieving revision 1.30
+diff -u -p -u -p -r1.30 control.c
+--- control.c	4 Dec 2018 08:15:09 -0000	1.30
++++ control.c	3 Jun 2020 18:34:25 -0000
+@@ -29,6 +29,7 @@
+ #include <errno.h>
+ #include <event.h>
+ #include <fcntl.h>
++#include <pthread.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -39,6 +40,8 @@
+ 
+ #define	CONTROL_BACKLOG	5
+ 
++extern struct event_base *global_evbase;
++
+ struct ctl_connlist ctl_conns;
+ 
+ void
+@@ -198,8 +201,10 @@ control_listen(struct control_sock *cs)
+ 
+ 	event_set(&cs->cs_ev, cs->cs_fd, EV_READ,
+ 	    control_accept, cs);
++	event_base_set(global_evbase, &cs->cs_ev);
+ 	event_add(&cs->cs_ev, NULL);
+ 	evtimer_set(&cs->cs_evt, control_accept, cs);
++	event_base_set(global_evbase, &cs->cs_evt);
+ 
+ 	return (0);
+ }
+@@ -256,6 +261,7 @@ control_accept(int listenfd, short event
+ 	c->iev.data = cs;
+ 	event_set(&c->iev.ev, c->iev.ibuf.fd, c->iev.events,
+ 	    c->iev.handler, c->iev.data);
++	event_base_set(global_evbase, &c->iev.ev);
+ 	event_add(&c->iev.ev, NULL);
+ 
+ 	TAILQ_INSERT_TAIL(&ctl_conns, c, entry);
+Index: i8253.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/i8253.c,v
+retrieving revision 1.31
+diff -u -p -u -p -r1.31 i8253.c
+--- i8253.c	30 Nov 2019 00:51:29 -0000	1.31
++++ i8253.c	3 Jun 2020 18:34:25 -0000
+@@ -23,6 +23,7 @@
+ #include <machine/vmmvar.h>
+ 
+ #include <event.h>
++#include <pthread.h>
+ #include <string.h>
+ #include <stddef.h>
+ #include <time.h>
+@@ -30,6 +31,7 @@
+ 
+ #include "i8253.h"
+ #include "proc.h"
++#include "vmd.h"
+ #include "vmm.h"
+ #include "atomicio.h"
+ 
+@@ -43,6 +45,9 @@ extern char *__progname;
+  */
+ struct i8253_channel i8253_channel[3];
+ 
++extern struct event_base *global_evbase;
++extern pthread_mutex_t global_evmutex;
++
+ /*
+  * i8253_init
+  *
+@@ -75,8 +80,13 @@ i8253_init(uint32_t vm_id)
+ 	i8253_channel[2].state = 0;
+ 
+ 	evtimer_set(&i8253_channel[0].timer, i8253_fire, &i8253_channel[0]);
++	event_base_set(global_evbase, &i8253_channel[0].timer);
++
+ 	evtimer_set(&i8253_channel[1].timer, i8253_fire, &i8253_channel[1]);
++	event_base_set(global_evbase, &i8253_channel[1].timer);
++
+ 	evtimer_set(&i8253_channel[2].timer, i8253_fire, &i8253_channel[2]);
++	event_base_set(global_evbase, &i8253_channel[2].timer);
+ }
+ 
+ /*
+@@ -311,14 +321,18 @@ i8253_reset(uint8_t chn)
+ {
+ 	struct timeval tv;
+ 
+-	evtimer_del(&i8253_channel[chn].timer);
++	mutex_lock(&global_evmutex);
++	if (evtimer_pending(&i8253_channel[chn].timer, NULL))
++	    evtimer_del(&i8253_channel[chn].timer);
+ 	timerclear(&tv);
+ 
+ 	i8253_channel[chn].in_use = 1;
+ 	i8253_channel[chn].state = 0;
+ 	tv.tv_usec = (i8253_channel[chn].start * NS_PER_TICK) / 1000;
+ 	clock_gettime(CLOCK_MONOTONIC, &i8253_channel[chn].ts);
++
+ 	evtimer_add(&i8253_channel[chn].timer, &tv);
++	mutex_unlock(&global_evmutex);
+ }
+ 
+ /*
+@@ -344,7 +358,9 @@ i8253_fire(int fd, short type, void *arg
+ 	if (ctr->mode != TIMER_INTTC) {
+ 		timerclear(&tv);
+ 		tv.tv_usec = (ctr->start * NS_PER_TICK) / 1000;
++		mutex_lock(&global_evmutex);
+ 		evtimer_add(&ctr->timer, &tv);
++		mutex_unlock(&global_evmutex);
+ 	} else
+ 		ctr->state = 1;
+ }
+@@ -377,6 +393,8 @@ i8253_restore(int fd, uint32_t vm_id)
+ 		i8253_channel[i].vm_id = vm_id;
+ 		evtimer_set(&i8253_channel[i].timer, i8253_fire,
+ 		    &i8253_channel[i]);
++		event_base_set(global_evbase, &i8253_channel[i].timer);
++
+ 		i8253_reset(i);
+ 	}
+ 	return (0);
+@@ -386,8 +404,10 @@ void
+ i8253_stop()
+ {
+ 	int i;
++	mutex_lock(&global_evmutex);
+ 	for (i = 0; i < 3; i++)
+ 		evtimer_del(&i8253_channel[i].timer);
++	mutex_lock(&global_evmutex);
+ }
+ 
+ void
+Index: mc146818.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/mc146818.c,v
+retrieving revision 1.21
+diff -u -p -u -p -r1.21 mc146818.c
+--- mc146818.c	30 Nov 2019 00:51:29 -0000	1.21
++++ mc146818.c	3 Jun 2020 18:34:25 -0000
+@@ -23,6 +23,7 @@
+ #include <machine/vmmvar.h>
+ 
+ #include <event.h>
++#include <pthread.h>
+ #include <stddef.h>
+ #include <string.h>
+ #include <time.h>
+@@ -50,6 +51,9 @@
+ 
+ #define TOBCD(x)	(((x) / 10 * 16) + ((x) % 10))
+ 
++extern struct event_base *global_evbase;
++extern pthread_mutex_t global_evmutex;
++
+ struct mc146818 {
+ 	time_t now;
+ 	uint8_t idx;
+@@ -110,7 +114,10 @@ rtc_fire1(int fd, short type, void *arg)
+ 		    "resync", __func__, (rtc.now - old));
+ 		vmmci_ctl(VMMCI_SYNCRTC);
+ 	}
+-	evtimer_add(&rtc.sec, &rtc.sec_tv);
++
++	mutex_lock(&global_evmutex);
++	event_add(&rtc.sec, &rtc.sec_tv);
++	mutex_unlock(&global_evmutex);
+ }
+ 
+ /*
+@@ -131,7 +138,9 @@ rtc_fireper(int fd, short type, void *ar
+ 	vcpu_assert_pic_irq((ptrdiff_t)arg, 0, 8);
+ 	vcpu_deassert_pic_irq((ptrdiff_t)arg, 0, 8);
+ 
+-	evtimer_add(&rtc.per, &rtc.per_tv);
++	mutex_lock(&global_evmutex);
++	event_add(&rtc.per, &rtc.per_tv);
++	mutex_unlock(&global_evmutex);
+ }
+ 
+ /*
+@@ -172,9 +181,11 @@ mc146818_init(uint32_t vm_id, uint64_t m
+ 	timerclear(&rtc.per_tv);
+ 
+ 	evtimer_set(&rtc.sec, rtc_fire1, NULL);
++	event_base_set(global_evbase, &rtc.sec);
+ 	evtimer_add(&rtc.sec, &rtc.sec_tv);
+ 
+ 	evtimer_set(&rtc.per, rtc_fireper, (void *)(intptr_t)rtc.vm_id);
++	event_base_set(global_evbase, &rtc.per);
+ }
+ 
+ /*
+@@ -193,10 +204,13 @@ rtc_reschedule_per(void)
+ 		rate = 32768 >> ((rtc.regs[MC_REGA] & MC_RATE_MASK) - 1);
+ 		us = (1.0 / rate) * 1000000;
+ 		rtc.per_tv.tv_usec = us;
++
++		mutex_lock(&global_evmutex);
+ 		if (evtimer_pending(&rtc.per, NULL))
+ 			evtimer_del(&rtc.per);
+ 
+ 		evtimer_add(&rtc.per, &rtc.per_tv);
++		mutex_unlock(&global_evmutex);
+ 	}
+ }
+ 
+@@ -341,20 +355,29 @@ mc146818_restore(int fd, uint32_t vm_id)
+ 	memset(&rtc.sec, 0, sizeof(struct event));
+ 	memset(&rtc.per, 0, sizeof(struct event));
+ 	evtimer_set(&rtc.sec, rtc_fire1, NULL);
++	event_base_set(global_evbase, &rtc.sec);
++
+ 	evtimer_set(&rtc.per, rtc_fireper, (void *)(intptr_t)rtc.vm_id);
++	event_base_set(global_evbase, &rtc.per);
++
+ 	return (0);
+ }
+ 
+ void
+ mc146818_stop()
+ {
++	mutex_lock(&global_evmutex);
+ 	evtimer_del(&rtc.per);
+ 	evtimer_del(&rtc.sec);
++	mutex_unlock(&global_evmutex);
+ }
+ 
+ void
+ mc146818_start()
+ {
++	mutex_lock(&global_evmutex);
+ 	evtimer_add(&rtc.sec, &rtc.sec_tv);
++	mutex_unlock(&global_evmutex);
++
+ 	rtc_reschedule_per();
+ }
+Index: ns8250.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/ns8250.c,v
+retrieving revision 1.25
+diff -u -p -u -p -r1.25 ns8250.c
+--- ns8250.c	11 Dec 2019 06:45:16 -0000	1.25
++++ ns8250.c	3 Jun 2020 18:34:25 -0000
+@@ -37,6 +37,9 @@
+ extern char *__progname;
+ struct ns8250_dev com1_dev;
+ 
++extern struct event_base *global_evbase;
++extern pthread_mutex_t global_evmutex;
++
+ static void com_rcv_event(int, short, void *);
+ static void com_rcv(struct ns8250_dev *, uint32_t, uint32_t);
+ 
+@@ -54,11 +57,17 @@ static void com_rcv(struct ns8250_dev *,
+ static void
+ ratelimit(int fd, short type, void *arg)
+ {
+-	/* Set TXRDY and clear "no pending interrupt" */
++	mutex_lock(&com1_dev.mutex);
+ 	com1_dev.regs.iir |= IIR_TXRDY;
+ 	com1_dev.regs.iir &= ~IIR_NOPEND;
++	mutex_unlock(&com1_dev.mutex);
++
+ 	vcpu_assert_pic_irq(com1_dev.vmid, 0, com1_dev.irq);
+ 	vcpu_deassert_pic_irq(com1_dev.vmid, 0, com1_dev.irq);
++
++	mutex_lock(&global_evmutex);
++	evtimer_add(&com1_dev.rate, &com1_dev.rate_tv);
++	mutex_unlock(&global_evmutex);
+ }
+ 
+ void
+@@ -72,6 +81,7 @@ ns8250_init(int fd, uint32_t vmid)
+ 		errno = ret;
+ 		fatal("could not initialize com1 mutex");
+ 	}
++
+ 	com1_dev.fd = fd;
+ 	com1_dev.irq = 4;
+ 	com1_dev.portid = NS8250_COM1;
+@@ -98,6 +108,7 @@ ns8250_init(int fd, uint32_t vmid)
+ 
+ 	event_set(&com1_dev.event, com1_dev.fd, EV_READ | EV_PERSIST,
+ 	    com_rcv_event, (void *)(intptr_t)vmid);
++	event_base_set(global_evbase, &com1_dev.event);
+ 
+ 	/*
+ 	 * Whenever fd is writable implies that the pty slave is connected.
+@@ -106,12 +117,15 @@ ns8250_init(int fd, uint32_t vmid)
+ 	 */
+ 	event_set(&com1_dev.wake, com1_dev.fd, EV_WRITE,
+ 	    com_rcv_event, (void *)(intptr_t)vmid);
+-	event_add(&com1_dev.wake, NULL);
++	event_base_set(global_evbase, &com1_dev.wake);
++	event_add(&com1_dev.event, NULL);
+ 
+ 	/* Rate limiter for simulating baud rate */
+ 	timerclear(&com1_dev.rate_tv);
+ 	com1_dev.rate_tv.tv_usec = 10000;
+ 	evtimer_set(&com1_dev.rate, ratelimit, NULL);
++	event_base_set(global_evbase, &com1_dev.rate);
++	evtimer_add(&com1_dev.rate, &com1_dev.rate_tv);
+ }
+ 
+ static void
+@@ -120,7 +134,10 @@ com_rcv_event(int fd, short kind, void *
+ 	mutex_lock(&com1_dev.mutex);
+ 
+ 	if (kind == EV_WRITE) {
++		mutex_lock(&global_evmutex);
+ 		event_add(&com1_dev.event, NULL);
++		mutex_unlock(&global_evmutex);
++
+ 		mutex_unlock(&com1_dev.mutex);
+ 		return;
+ 	}
+@@ -201,8 +218,10 @@ com_rcv(struct ns8250_dev *com, uint32_t
+ 		if (errno != EAGAIN)
+ 			log_warn("unexpected read error on com device");
+ 	} else if (sz == 0) {
++		mutex_lock(&global_evmutex);
+ 		event_del(&com->event);
+ 		event_add(&com->wake, NULL);
++		mutex_unlock(&global_evmutex);
+ 		return;
+ 	} else if (sz != 1 && sz != 2)
+ 		log_warnx("unexpected read return value %zd on com device", sz);
+@@ -258,8 +277,7 @@ vcpu_process_com_data(struct vm_exit *ve
+ 			/* Limit output rate if needed */
+ 			if (com1_dev.pause_ct > 0 &&
+ 			    com1_dev.byte_out % com1_dev.pause_ct == 0) {
+-					evtimer_add(&com1_dev.rate,
+-					    &com1_dev.rate_tv);
++				// skip evtimer_add(com1_dev.rate, &com1_dev.rate_tv);
+ 			} else {
+ 				/* Set TXRDY and clear "no pending interrupt" */
+ 				com1_dev.regs.iir |= IIR_TXRDY;
+@@ -654,15 +672,15 @@ ns8250_restore(int fd, int con_fd, uint3
+ 	com1_dev.byte_out = 0;
+ 	com1_dev.regs.divlo = 1;
+ 	com1_dev.baudrate = 115200;
+-	com1_dev.rate_tv.tv_usec = 10000;
+ 	com1_dev.pause_ct = (com1_dev.baudrate / 8) / 1000 * 10;
+-	evtimer_set(&com1_dev.rate, ratelimit, NULL);
+ 
+ 	event_set(&com1_dev.event, com1_dev.fd, EV_READ | EV_PERSIST,
+ 	    com_rcv_event, (void *)(intptr_t)vmid);
++	event_base_set(global_evbase, &com1_dev.event);
+ 
+ 	event_set(&com1_dev.wake, com1_dev.fd, EV_WRITE,
+ 	    com_rcv_event, (void *)(intptr_t)vmid);
++	event_base_set(global_evbase, &com1_dev.wake);
+ 
+ 	return (0);
+ }
+@@ -670,15 +688,19 @@ ns8250_restore(int fd, int con_fd, uint3
+ void
+ ns8250_stop()
+ {
+-	if(event_del(&com1_dev.event))
++	mutex_lock(&global_evmutex);
++	if (event_del(&com1_dev.event))
+ 		log_warn("could not delete ns8250 event handler");
+-	evtimer_del(&com1_dev.rate);
++	event_del(&com1_dev.rate);
++	mutex_unlock(&global_evmutex);
+ }
+ 
+ void
+ ns8250_start()
+ {
++	mutex_lock(&global_evmutex);
+ 	event_add(&com1_dev.event, NULL);
+ 	event_add(&com1_dev.wake, NULL);
+ 	evtimer_add(&com1_dev.rate, &com1_dev.rate_tv);
++	mutex_unlock(&global_evmutex);
+ }
+Index: priv.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/priv.c,v
+retrieving revision 1.15
+diff -u -p -u -p -r1.15 priv.c
+--- priv.c	28 Jun 2019 13:32:51 -0000	1.15
++++ priv.c	3 Jun 2020 18:34:25 -0000
+@@ -46,6 +46,8 @@
+ #include "proc.h"
+ #include "vmd.h"
+ 
++extern struct event_base *global_evbase;
++
+ int	 priv_dispatch_parent(int, struct privsep_proc *, struct imsg *);
+ void	 priv_run(struct privsep *, struct privsep_proc *, void *);
+ 
+Index: proc.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/proc.c,v
+retrieving revision 1.18
+diff -u -p -u -p -r1.18 proc.c
+--- proc.c	10 Sep 2018 10:36:01 -0000	1.18
++++ proc.c	3 Jun 2020 18:34:25 -0000
+@@ -30,12 +30,15 @@
+ #include <errno.h>
+ #include <signal.h>
+ #include <paths.h>
++#include <pthread.h>
+ #include <pwd.h>
+ #include <event.h>
+ #include <imsg.h>
+ 
+ #include "proc.h"
+ 
++extern struct event_base *global_evbase;
++
+ void	 proc_exec(struct privsep *, struct privsep_proc *, unsigned int, int,
+ 	    int, char **);
+ void	 proc_setup(struct privsep *, struct privsep_proc *, unsigned int);
+@@ -158,6 +161,7 @@ proc_exec(struct privsep *ps, struct pri
+ 			default:
+ 				/* Close child end. */
+ 				close(fd);
++				event_reinit(global_evbase);
+ 				break;
+ 			}
+ 		}
+@@ -185,6 +189,7 @@ proc_connect(struct privsep *ps)
+ 			imsg_init(&iev->ibuf, ps->ps_pp->pp_pipes[dst][inst]);
+ 			event_set(&iev->ev, iev->ibuf.fd, iev->events,
+ 			    iev->handler, iev->data);
++			event_base_set(global_evbase, &iev->ev);
+ 			event_add(&iev->ev, NULL);
+ 		}
+ 	}
+@@ -290,6 +295,7 @@ proc_accept(struct privsep *ps, int fd, 
+ 	iev = &ps->ps_ievs[dst][n];
+ 	imsg_init(&iev->ibuf, fd);
+ 	event_set(&iev->ev, iev->ibuf.fd, iev->events, iev->handler, iev->data);
++	event_base_set(global_evbase, &iev->ev);
+ 	event_add(&iev->ev, NULL);
+ }
+ 
+@@ -566,14 +572,21 @@ proc_run(struct privsep *ps, struct priv
+ 	    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid))
+ 		fatal("%s: cannot drop privileges", __func__);
+ 
+-	event_init();
++	//event_init();
++	//global_evbase = event_base_new();
+ 
+ 	signal_set(&ps->ps_evsigint, SIGINT, proc_sig_handler, p);
++	event_base_set(global_evbase, &ps->ps_evsigint);
+ 	signal_set(&ps->ps_evsigterm, SIGTERM, proc_sig_handler, p);
++	event_base_set(global_evbase, &ps->ps_evsigterm);
+ 	signal_set(&ps->ps_evsigchld, SIGCHLD, proc_sig_handler, p);
++	event_base_set(global_evbase, &ps->ps_evsigchld);
+ 	signal_set(&ps->ps_evsighup, SIGHUP, proc_sig_handler, p);
++	event_base_set(global_evbase, &ps->ps_evsighup);
+ 	signal_set(&ps->ps_evsigpipe, SIGPIPE, proc_sig_handler, p);
++	event_base_set(global_evbase, &ps->ps_evsigpipe);
+ 	signal_set(&ps->ps_evsigusr1, SIGUSR1, proc_sig_handler, p);
++	event_base_set(global_evbase, &ps->ps_evsigusr1);
+ 
+ 	signal_add(&ps->ps_evsigint, NULL);
+ 	signal_add(&ps->ps_evsigterm, NULL);
+@@ -599,7 +612,7 @@ proc_run(struct privsep *ps, struct priv
+ 	if (run != NULL)
+ 		run(ps, p, arg);
+ 
+-	event_dispatch();
++	event_base_dispatch(global_evbase);
+ 
+ 	proc_shutdown(p);
+ }
+@@ -626,7 +639,7 @@ proc_dispatch(int fd, short event, void 
+ 		if (n == 0) {
+ 			/* this pipe is dead, so remove the event handler */
+ 			event_del(&iev->ev);
+-			event_loopexit(NULL);
++			event_base_loopexit(global_evbase, NULL);
+ 			return;
+ 		}
+ 	}
+@@ -637,7 +650,7 @@ proc_dispatch(int fd, short event, void 
+ 		if (n == 0) {
+ 			/* this pipe is dead, so remove the event handler */
+ 			event_del(&iev->ev);
+-			event_loopexit(NULL);
++			event_base_loopexit(global_evbase, NULL);
+ 			return;
+ 		}
+ 	}
+@@ -714,6 +727,7 @@ imsg_event_add(struct imsgev *iev)
+ 
+ 	event_del(&iev->ev);
+ 	event_set(&iev->ev, iev->ibuf.fd, iev->events, iev->handler, iev->data);
++	event_base_set(global_evbase, &iev->ev);
+ 	event_add(&iev->ev, NULL);
+ }
+ 
+Index: virtio.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/virtio.c,v
+retrieving revision 1.82
+diff -u -p -u -p -r1.82 virtio.c
+--- virtio.c	11 Dec 2019 06:45:16 -0000	1.82
++++ virtio.c	3 Jun 2020 18:34:25 -0000
+@@ -34,6 +34,7 @@
+ #include <errno.h>
+ #include <event.h>
+ #include <poll.h>
++#include <pthread.h>
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -54,6 +55,9 @@ struct vionet_dev *vionet;
+ struct vioscsi_dev *vioscsi;
+ struct vmmci_dev vmmci;
+ 
++extern struct event_base *global_evbase;
++extern pthread_mutex_t global_evmutex;
++
+ int nr_vionet;
+ int nr_vioblk;
+ 
+@@ -1587,7 +1591,9 @@ vmmci_ctl(unsigned int cmd)
+ 
+ 		/* Add ACK timeout */
+ 		tv.tv_sec = VMMCI_TIMEOUT;
++		mutex_lock(&global_evmutex);
+ 		evtimer_add(&vmmci.timeout, &tv);
++		mutex_unlock(&global_evmutex);
+ 		break;
+ 	case VMMCI_SYNCRTC:
+ 		if (vmmci.cfg.guest_feature & VMMCI_F_SYNCRTC) {
+@@ -1627,7 +1633,10 @@ vmmci_ack(unsigned int cmd)
+ 			log_debug("%s: vm %u requested shutdown", __func__,
+ 			    vmmci.vm_id);
+ 			tv.tv_sec = VMMCI_TIMEOUT;
++
++			mutex_lock(&global_evmutex);
+ 			evtimer_add(&vmmci.timeout, &tv);
++			mutex_unlock(&global_evmutex);
+ 			return;
+ 		}
+ 		/* FALLTHROUGH */
+@@ -1639,6 +1648,7 @@ vmmci_ack(unsigned int cmd)
+ 		 * rc.shutdown on the VM), so increase the timeout before
+ 		 * killing it forcefully.
+ 		 */
++		mutex_lock(&global_evmutex);
+ 		if (cmd == vmmci.cmd &&
+ 		    evtimer_pending(&vmmci.timeout, NULL)) {
+ 			log_debug("%s: vm %u acknowledged shutdown request",
+@@ -1646,6 +1656,7 @@ vmmci_ack(unsigned int cmd)
+ 			tv.tv_sec = VMMCI_SHUTDOWN_TIMEOUT;
+ 			evtimer_add(&vmmci.timeout, &tv);
+ 		}
++		mutex_unlock(&global_evmutex);
+ 		break;
+ 	case VMMCI_SYNCRTC:
+ 		log_debug("%s: vm %u acknowledged RTC sync request",
+@@ -1879,6 +1890,7 @@ virtio_init(struct vmd_vm *vm, int child
+ 
+ 			event_set(&vionet[i].event, vionet[i].fd,
+ 			    EV_READ | EV_PERSIST, vionet_rx_event, &vionet[i]);
++			event_base_set(global_evbase, &vionet[i].event);
+ 			if (event_add(&vionet[i].event, NULL)) {
+ 				log_warn("could not initialize vionet event "
+ 				    "handler");
+@@ -2033,6 +2045,7 @@ virtio_init(struct vmd_vm *vm, int child
+ 	vmmci.pci_id = id;
+ 
+ 	evtimer_set(&vmmci.timeout, vmmci_timeout, NULL);
++	event_base_set(global_evbase, &vmmci.timeout);
+ }
+ 
+ void
+@@ -2066,6 +2079,7 @@ vmmci_restore(int fd, uint32_t vm_id)
+ 	vmmci.irq = pci_get_dev_irq(vmmci.pci_id);
+ 	memset(&vmmci.timeout, 0, sizeof(struct event));
+ 	evtimer_set(&vmmci.timeout, vmmci_timeout, NULL);
++	event_base_set(global_evbase, &vmmci.timeout);
+ 	return (0);
+ }
+ 
+@@ -2140,6 +2154,7 @@ vionet_restore(int fd, struct vmd_vm *vm
+ 			memset(&vionet[i].event, 0, sizeof(struct event));
+ 			event_set(&vionet[i].event, vionet[i].fd,
+ 			    EV_READ | EV_PERSIST, vionet_rx_event, &vionet[i]);
++			event_base_set(global_evbase, &vionet[i].event);
+ 		}
+ 	}
+ 	return (0);
+@@ -2338,24 +2353,28 @@ void
+ virtio_stop(struct vm_create_params *vcp)
+ {
+ 	uint8_t i;
++	mutex_lock(&global_evmutex);
+ 	for (i = 0; i < vcp->vcp_nnics; i++) {
+ 		if (event_del(&vionet[i].event)) {
+ 			log_warn("could not initialize vionet event "
+ 			    "handler");
+-			return;
++			break;
+ 		}
+ 	}
++	mutex_unlock(&global_evmutex);
+ }
+ 
+ void
+ virtio_start(struct vm_create_params *vcp)
+ {
+ 	uint8_t i;
++	mutex_lock(&global_evmutex);
+ 	for (i = 0; i < vcp->vcp_nnics; i++) {
+ 		if (event_add(&vionet[i].event, NULL)) {
+ 			log_warn("could not initialize vionet event "
+ 			    "handler");
+-			return;
++			break;
+ 		}
+ 	}
++	mutex_unlock(&global_evmutex);
+ }
+Index: vm.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vm.c,v
+retrieving revision 1.57
+diff -u -p -u -p -r1.57 vm.c
+--- vm.c	30 Apr 2020 03:50:53 -0000	1.57
++++ vm.c	3 Jun 2020 18:34:25 -0000
+@@ -107,6 +107,9 @@ extern struct vmd *env;
+ 
+ extern char *__progname;
+ 
++extern struct event_base *global_evbase;
++extern pthread_mutex_t global_evmutex;
++
+ pthread_mutex_t threadmutex;
+ pthread_cond_t threadcond;
+ 
+@@ -364,8 +367,6 @@ start_vm(struct vmd_vm *vm, int fd)
+ 	for (i = 0; i < VMM_MAX_NICS_PER_VM; i++)
+ 		nicfds[i] = vm->vm_ifs[i].vif_fd;
+ 
+-	event_init();
+-
+ 	if (vm->vm_state & VM_STATE_RECEIVED) {
+ 		restore_emulated_hw(vcp, vm->vm_receive_fd, nicfds,
+ 		    vm->vm_disks, vm->vm_cdrom);
+@@ -403,6 +404,8 @@ vm_dispatch_vmm(int fd, short event, voi
+ 	ssize_t			 n;
+ 	int			 verbose;
+ 
++	pthread_mutex_lock(&global_evmutex);
++
+ 	if (event & EV_READ) {
+ 		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
+ 			fatal("%s: imsg_read", __func__);
+@@ -424,7 +427,7 @@ vm_dispatch_vmm(int fd, short event, voi
+ 			break;
+ 
+ #if DEBUG > 1
+-		log_debug("%s: got imsg %d from %s",
++		log_info("%s: got imsg %d from %s",
+ 		    __func__, imsg.hdr.type,
+ 		    vm->vm_params.vmc_params.vcp_name);
+ #endif
+@@ -482,6 +485,8 @@ vm_dispatch_vmm(int fd, short event, voi
+ 		imsg_free(&imsg);
+ 	}
+ 	imsg_event_add(iev);
++
++	pthread_mutex_unlock(&global_evmutex);
+ }
+ 
+ /*
+@@ -492,6 +497,8 @@ vm_dispatch_vmm(int fd, short event, voi
+ __dead void
+ vm_shutdown(unsigned int cmd)
+ {
++	pthread_mutex_lock(&global_evmutex);
++
+ 	switch (cmd) {
+ 	case VMMCI_NONE:
+ 	case VMMCI_SHUTDOWN:
+@@ -507,6 +514,8 @@ vm_shutdown(unsigned int cmd)
+ 	}
+ 	imsg_flush(&current_vm->vm_iev.ibuf);
+ 
++	pthread_mutex_unlock(&global_evmutex);
++
+ 	_exit(0);
+ }
+ 
+@@ -777,9 +786,13 @@ pause_vm(struct vm_create_params *vcp)
+ 	}
+ 
+ 	i8253_stop();
++	log_debug("%s: i8253 stopped", __func__);
+ 	mc146818_stop();
++	log_debug("%s: mc14618 stopped", __func__);
+ 	ns8250_stop();
++	log_debug("%s: ns8250 stopped", __func__);
+ 	virtio_stop(vcp);
++	log_debug("%s: virtio stopped", __func__);
+ }
+ 
+ void
+@@ -800,10 +813,14 @@ unpause_vm(struct vm_create_params *vcp)
+ 		}
+ 	}
+ 
+-	i8253_start();
+-	mc146818_start();
+-	ns8250_start();
+ 	virtio_start(vcp);
++	log_debug("%s: virtio restarted", __func__);
++	ns8250_start();
++	log_debug("%s: ns8250 restarted", __func__);
++	mc146818_start();
++	log_debug("%s: mc146818 restarted", __func__);
++	i8253_start();
++	log_debug("%s: i8253 restarted", __func__);
+ }
+ 
+ /*
+@@ -1063,6 +1080,7 @@ init_emulated_hw(struct vmop_create_para
+ 	/* Initialize virtio devices */
+ 	virtio_init(current_vm, child_cdrom, child_disks, child_taps);
+ }
++
+ /*
+  * restore_emulated_hw
+  *
+@@ -1357,7 +1375,7 @@ event_thread(void *arg)
+ 	uint8_t *donep = arg;
+ 	intptr_t ret;
+ 
+-	ret = event_dispatch();
++	ret = event_base_dispatch(global_evbase);
+ 
+ 	mutex_lock(&threadmutex);
+ 	*donep = 1;
+Index: vmd.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vmd.c,v
+retrieving revision 1.117
+diff -u -p -u -p -r1.117 vmd.c
+--- vmd.c	12 Dec 2019 03:53:38 -0000	1.117
++++ vmd.c	3 Jun 2020 18:34:25 -0000
+@@ -33,6 +33,7 @@
+ #include <errno.h>
+ #include <event.h>
+ #include <fcntl.h>
++#include <pthread.h>
+ #include <pwd.h>
+ #include <signal.h>
+ #include <syslog.h>
+@@ -75,6 +76,8 @@ static struct privsep_proc procs[] = {
+ 	{ "vmm",	PROC_VMM,	vmd_dispatch_vmm, vmm, vmm_shutdown },
+ };
+ 
++pthread_mutex_t global_evmutex;
++struct event_base *global_evbase;
+ struct event staggered_start_timer;
+ 
+ /* For the privileged process */
+@@ -820,6 +823,12 @@ main(int argc, char **argv)
+ 	if (title != NULL)
+ 		ps->ps_title[proc_id] = title;
+ 
++	global_evbase = event_base_new();
++
++	if (pthread_mutex_init(&global_evmutex, NULL)) {
++		fatal("can't initialize global pthread_mutex");
++	}
++
+ 	/* only the parent returns */
+ 	proc_init(ps, procs, nitems(procs), env->vmd_debug, argc0, argv,
+ 	    proc_id);
+@@ -831,13 +840,16 @@ main(int argc, char **argv)
+ 	if (ps->ps_noaction == 0)
+ 		log_info("startup");
+ 
+-	event_init();
+-
+ 	signal_set(&ps->ps_evsigint, SIGINT, vmd_sighdlr, ps);
++	event_base_set(global_evbase, &ps->ps_evsigint);
+ 	signal_set(&ps->ps_evsigterm, SIGTERM, vmd_sighdlr, ps);
++	event_base_set(global_evbase, &ps->ps_evsigterm);
+ 	signal_set(&ps->ps_evsighup, SIGHUP, vmd_sighdlr, ps);
++	event_base_set(global_evbase, &ps->ps_evsighup);
+ 	signal_set(&ps->ps_evsigpipe, SIGPIPE, vmd_sighdlr, ps);
++	event_base_set(global_evbase, &ps->ps_evsigpipe);
+ 	signal_set(&ps->ps_evsigusr1, SIGUSR1, vmd_sighdlr, ps);
++	event_base_set(global_evbase, &ps->ps_evsigusr1);
+ 
+ 	signal_add(&ps->ps_evsigint, NULL);
+ 	signal_add(&ps->ps_evsigterm, NULL);
+@@ -851,7 +863,7 @@ main(int argc, char **argv)
+ 	if (vmd_configure() == -1)
+ 		fatalx("configuration failed");
+ 
+-	event_dispatch();
++	event_base_dispatch(global_evbase);
+ 
+ 	log_debug("parent exiting");
+ 
+@@ -951,6 +963,8 @@ vmd_configure(void)
+ 
+ 	log_debug("%s: starting vms in staggered fashion", __func__);
+ 	evtimer_set(&staggered_start_timer, start_vm_batch, NULL);
++	event_base_set(global_evbase, &staggered_start_timer);
++
+ 	/* start first batch */
+ 	start_vm_batch(0, 0, NULL);
+ 
+@@ -1021,6 +1035,8 @@ vmd_reload(unsigned int reset, const cha
+ 
+ 		log_debug("%s: starting vms in staggered fashion", __func__);
+ 		evtimer_set(&staggered_start_timer, start_vm_batch, NULL);
++		event_base_set(global_evbase, &staggered_start_timer);
++
+ 		/* start first batch */
+ 		start_vm_batch(0, 0, NULL);
+ 
+Index: vmm.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vmm.c,v
+retrieving revision 1.96
+diff -u -p -u -p -r1.96 vmm.c
+--- vmm.c	30 Apr 2020 03:50:53 -0000	1.96
++++ vmm.c	3 Jun 2020 18:34:25 -0000
+@@ -64,6 +64,9 @@ int opentap(char *);
+ 
+ extern struct vmd *env;
+ 
++extern pthread_mutex_t global_evmutex;
++extern struct event_base *global_evbase;
++
+ static struct privsep_proc procs[] = {
+ 	{ "parent",	PROC_PARENT,	vmm_dispatch_parent  },
+ };
+@@ -80,9 +83,12 @@ vmm_run(struct privsep *ps, struct privs
+ 	if (config_init(ps->ps_env) == -1)
+ 		fatal("failed to initialize configuration");
+ 
++	pthread_mutex_lock(&global_evmutex);
+ 	signal_del(&ps->ps_evsigchld);
+ 	signal_set(&ps->ps_evsigchld, SIGCHLD, vmm_sighdlr, ps);
++	event_base_set(global_evbase, &ps->ps_evsigchld);
+ 	signal_add(&ps->ps_evsigchld, NULL);
++	pthread_mutex_unlock(&global_evmutex);
+ 
+ 	/*
+ 	 * pledge in the vmm process:
+@@ -198,7 +204,7 @@ vmm_dispatch_parent(int fd, struct privs
+ 				/*
+ 				 * Request reboot but mark the VM as shutting
+ 				 * down. This way we can terminate the VM after
+-				 * the triple fault instead of reboot and 
++				 * the triple fault instead of reboot and
+ 				 * avoid being stuck in the ACPI-less powerdown
+ 				 * ("press any key to reboot") of the VM.
+ 				 */
+@@ -709,6 +715,8 @@ vmm_start_vm(struct imsg *imsg, uint32_t
+ 		/* Child */
+ 		close(fds[0]);
+ 		close(PROC_PARENT_SOCK_FILENO);
++
++		event_reinit(global_evbase);
+ 
+ 		ret = start_vm(vm, fds[1]);
+ 

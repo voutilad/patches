@@ -1,0 +1,40 @@
+Index: loadfile_elf.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/loadfile_elf.c,v
+retrieving revision 1.35
+diff -u -p -u -p -r1.35 loadfile_elf.c
+--- loadfile_elf.c	16 May 2019 21:16:04 -0000	1.35
++++ loadfile_elf.c	7 Jul 2020 14:15:15 -0000
+@@ -501,7 +501,7 @@ size_t
+ mread(FILE *fp, paddr_t addr, size_t sz)
+ {
+ 	size_t ct;
+-	size_t i, rd, osz;
++	size_t i, osz;
+ 	char buf[PAGE_SIZE];
+ 
+ 	/*
+@@ -509,7 +509,6 @@ mread(FILE *fp, paddr_t addr, size_t sz)
+ 	 * write_mem
+ 	 */
+ 	ct = 0;
+-	rd = 0;
+ 	osz = sz;
+ 	if ((addr & PAGE_MASK) != 0) {
+ 		memset(buf, 0, sizeof(buf));
+@@ -522,7 +521,6 @@ mread(FILE *fp, paddr_t addr, size_t sz)
+ 			log_warn("%s: error %d in mread", __progname, errno);
+ 			return (0);
+ 		}
+-		rd += ct;
+ 
+ 		if (write_mem(addr, buf, ct))
+ 			return (0);
+@@ -546,7 +544,6 @@ mread(FILE *fp, paddr_t addr, size_t sz)
+ 			log_warn("%s: error %d in mread", __progname, errno);
+ 			return (0);
+ 		}
+-		rd += ct;
+ 
+ 		if (write_mem(addr, buf, ct))
+ 			return (0);

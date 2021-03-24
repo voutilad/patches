@@ -1,0 +1,58 @@
+Index: ns8250.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/ns8250.c,v
+retrieving revision 1.27
+diff -u -p -u -p -r1.27 ns8250.c
+--- ns8250.c	16 Jun 2020 08:46:03 -0000	1.27
++++ ns8250.c	16 Jun 2020 17:46:18 -0000
+@@ -55,10 +55,13 @@ static void
+ ratelimit(int fd, short type, void *arg)
+ {
+ 	/* Set TXRDY and clear "no pending interrupt" */
++	mutex_lock(&com1_dev.mutex);
+ 	com1_dev.regs.iir |= IIR_TXRDY;
+ 	com1_dev.regs.iir &= ~IIR_NOPEND;
++
+ 	vcpu_assert_pic_irq(com1_dev.vmid, 0, com1_dev.irq);
+ 	vcpu_deassert_pic_irq(com1_dev.vmid, 0, com1_dev.irq);
++	mutex_unlock(&com1_dev.mutex);
+ }
+ 
+ void
+@@ -127,24 +130,21 @@ com_rcv_event(int fd, short kind, void *
+ 
+ 	/*
+ 	 * We already have other data pending to be received. The data that
+-	 * has become available now will be moved to the com port later.
++	 * has become available now will be moved to the com port later by
++	 * the vcpu.
+ 	 */
+-	if (com1_dev.rcv_pending) {
+-		mutex_unlock(&com1_dev.mutex);
+-		return;
++	if (!com1_dev.rcv_pending) {
++		if (com1_dev.regs.lsr & LSR_RXRDY)
++			com1_dev.rcv_pending = 1;
++		else
++			com_rcv(&com1_dev, (uintptr_t)arg, 0);
+ 	}
+ 
+-	if (com1_dev.regs.lsr & LSR_RXRDY)
+-		com1_dev.rcv_pending = 1;
+-	else {
+-		com_rcv(&com1_dev, (uintptr_t)arg, 0);
+-
+-		/* If pending interrupt, inject */
+-		if ((com1_dev.regs.iir & IIR_NOPEND) == 0) {
+-			/* XXX: vcpu_id */
+-			vcpu_assert_pic_irq((uintptr_t)arg, 0, com1_dev.irq);
+-			vcpu_deassert_pic_irq((uintptr_t)arg, 0, com1_dev.irq);
+-		}
++	/* If pending interrupt, inject */
++	if ((com1_dev.regs.iir & IIR_NOPEND) == 0) {
++		/* XXX: vcpu_id */
++		vcpu_assert_pic_irq((uintptr_t)arg, 0, com1_dev.irq);
++		vcpu_deassert_pic_irq((uintptr_t)arg, 0, com1_dev.irq);
+ 	}
+ 
+ 	mutex_unlock(&com1_dev.mutex);

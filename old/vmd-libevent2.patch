@@ -1,0 +1,1263 @@
+Index: Makefile
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/Makefile,v
+retrieving revision 1.22
+diff -u -p -u -p -r1.22 Makefile
+--- Makefile	18 Jan 2019 01:24:07 -0000	1.22
++++ Makefile	24 May 2020 01:24:47 -0000
+@@ -8,13 +8,13 @@ SRCS+=		vm.c loadfile_elf.c pci.c virtio
+ SRCS+=		ns8250.c i8253.c vmboot.c ufs.c disklabel.c dhcp.c packet.c
+ SRCS+=		parse.y atomicio.c vioscsi.c vioraw.c vioqcow2.c fw_cfg.c
+ 
+-CFLAGS+=	-Wall -I${.CURDIR}
++CFLAGS+=	-Wall -I${.CURDIR} -I/usr/local/include
+ CFLAGS+=	-Wstrict-prototypes -Wmissing-prototypes
+ CFLAGS+=	-Wmissing-declarations
+ CFLAGS+=	-Wshadow -Wpointer-arith -Wcast-qual
+ CFLAGS+=	-Wsign-compare
+ 
+-LDADD+=		-lutil -lpthread -levent
++LDADD+=		-L/usr/local/lib -lutil -lpthread -levent_core -levent_pthreads
+ DPADD+=		${LIBUTIL} ${LIBPTHREAD} ${LIBEVENT}
+ 
+ YFLAGS=
+Index: control.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/control.c,v
+retrieving revision 1.30
+diff -u -p -u -p -r1.30 control.c
+--- control.c	4 Dec 2018 08:15:09 -0000	1.30
++++ control.c	24 May 2020 01:24:47 -0000
+@@ -27,18 +27,21 @@
+ #include <net/if.h>
+ 
+ #include <errno.h>
+-#include <event.h>
+ #include <fcntl.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ #include <signal.h>
+ 
++#include <event2/event.h>
++#include <event2/event_struct.h>
++
+ #include "proc.h"
+ #include "vmd.h"
+ 
+ #define	CONTROL_BACKLOG	5
+ 
++extern struct event_base *evbase;
+ struct ctl_connlist ctl_conns;
+ 
+ void
+@@ -121,6 +124,8 @@ control_init(struct privsep *ps, struct 
+ 	int			 fd;
+ 	mode_t			 old_umask, mode;
+ 
++	log_debug("%s: %s, evbase: %p", __func__, *ps->ps_title, evbase);
++
+ 	if (cs->cs_name == NULL)
+ 		return (0);
+ 
+@@ -196,10 +201,10 @@ control_listen(struct control_sock *cs)
+ 		return (-1);
+ 	}
+ 
+-	event_set(&cs->cs_ev, cs->cs_fd, EV_READ,
++	cs->cs_ev = event_new(evbase, cs->cs_fd, EV_READ,
+ 	    control_accept, cs);
+-	event_add(&cs->cs_ev, NULL);
+-	evtimer_set(&cs->cs_evt, control_accept, cs);
++	event_add(cs->cs_ev, NULL);
++	cs->cs_evt = evtimer_new(evbase, control_accept, cs);
+ 
+ 	return (0);
+ }
+@@ -214,7 +219,7 @@ control_accept(int listenfd, short event
+ 	struct sockaddr_un	 sun;
+ 	struct ctl_conn		*c;
+ 
+-	event_add(&cs->cs_ev, NULL);
++	event_add(cs->cs_ev, NULL);
+ 	if ((event & EV_TIMEOUT))
+ 		return;
+ 
+@@ -228,8 +233,8 @@ control_accept(int listenfd, short event
+ 		if (errno == ENFILE || errno == EMFILE) {
+ 			struct timeval evtpause = { 1, 0 };
+ 
+-			event_del(&cs->cs_ev);
+-			evtimer_add(&cs->cs_evt, &evtpause);
++			event_del(cs->cs_ev);
++			evtimer_add(cs->cs_evt, &evtpause);
+ 		} else if (errno != EWOULDBLOCK && errno != EINTR &&
+ 		    errno != ECONNABORTED)
+ 			log_warn("%s: accept", __func__);
+@@ -254,9 +259,9 @@ control_accept(int listenfd, short event
+ 	c->iev.handler = control_dispatch_imsg;
+ 	c->iev.events = EV_READ;
+ 	c->iev.data = cs;
+-	event_set(&c->iev.ev, c->iev.ibuf.fd, c->iev.events,
++	c->iev.ev = event_new(evbase, c->iev.ibuf.fd, c->iev.events,
+ 	    c->iev.handler, c->iev.data);
+-	event_add(&c->iev.ev, NULL);
++	event_add(c->iev.ev, NULL);
+ 
+ 	TAILQ_INSERT_TAIL(&ctl_conns, c, entry);
+ }
+@@ -287,13 +292,13 @@ control_close(int fd, struct control_soc
+ 	msgbuf_clear(&c->iev.ibuf.w);
+ 	TAILQ_REMOVE(&ctl_conns, c, entry);
+ 
+-	event_del(&c->iev.ev);
++	event_free(c->iev.ev);
+ 	close(c->iev.ibuf.fd);
+ 
+ 	/* Some file descriptors are available again. */
+-	if (evtimer_pending(&cs->cs_evt, NULL)) {
+-		evtimer_del(&cs->cs_evt);
+-		event_add(&cs->cs_ev, NULL);
++	if (evtimer_pending(cs->cs_evt, NULL)) {
++		evtimer_del(cs->cs_evt);
++		event_add(cs->cs_ev, NULL);
+ 	}
+ 
+ 	free(c);
+Index: i8253.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/i8253.c,v
+retrieving revision 1.31
+diff -u -p -u -p -r1.31 i8253.c
+--- i8253.c	30 Nov 2019 00:51:29 -0000	1.31
++++ i8253.c	24 May 2020 01:24:47 -0000
+@@ -22,18 +22,21 @@
+ 
+ #include <machine/vmmvar.h>
+ 
+-#include <event.h>
+ #include <string.h>
+ #include <stddef.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
++#include <event2/event.h>
++#include <event2/event_struct.h>
++
+ #include "i8253.h"
+ #include "proc.h"
+ #include "vmm.h"
+ #include "atomicio.h"
+ 
+ extern char *__progname;
++extern struct event_base *evbase;
+ 
+ /*
+  * Channel 0 is used to generate the legacy hardclock interrupt (HZ).
+@@ -74,9 +77,9 @@ i8253_init(uint32_t vm_id)
+ 	i8253_channel[2].vm_id = vm_id;
+ 	i8253_channel[2].state = 0;
+ 
+-	evtimer_set(&i8253_channel[0].timer, i8253_fire, &i8253_channel[0]);
+-	evtimer_set(&i8253_channel[1].timer, i8253_fire, &i8253_channel[1]);
+-	evtimer_set(&i8253_channel[2].timer, i8253_fire, &i8253_channel[2]);
++	i8253_channel[0].timer = evtimer_new(evbase, i8253_fire, &i8253_channel[0]);
++	i8253_channel[1].timer = evtimer_new(evbase, i8253_fire, &i8253_channel[1]);
++	i8253_channel[2].timer = evtimer_new(evbase, i8253_fire, &i8253_channel[2]);
+ }
+ 
+ /*
+@@ -311,14 +314,14 @@ i8253_reset(uint8_t chn)
+ {
+ 	struct timeval tv;
+ 
+-	evtimer_del(&i8253_channel[chn].timer);
++	evtimer_del(i8253_channel[chn].timer);
+ 	timerclear(&tv);
+ 
+ 	i8253_channel[chn].in_use = 1;
+ 	i8253_channel[chn].state = 0;
+ 	tv.tv_usec = (i8253_channel[chn].start * NS_PER_TICK) / 1000;
+ 	clock_gettime(CLOCK_MONOTONIC, &i8253_channel[chn].ts);
+-	evtimer_add(&i8253_channel[chn].timer, &tv);
++	evtimer_add(i8253_channel[chn].timer, &tv);
+ }
+ 
+ /*
+@@ -344,7 +347,7 @@ i8253_fire(int fd, short type, void *arg
+ 	if (ctr->mode != TIMER_INTTC) {
+ 		timerclear(&tv);
+ 		tv.tv_usec = (ctr->start * NS_PER_TICK) / 1000;
+-		evtimer_add(&ctr->timer, &tv);
++		evtimer_add(ctr->timer, &tv);
+ 	} else
+ 		ctr->state = 1;
+ }
+@@ -375,7 +378,7 @@ i8253_restore(int fd, uint32_t vm_id)
+ 	for (i = 0; i < 3; i++) {
+ 		memset(&i8253_channel[i].timer, 0, sizeof(struct event));
+ 		i8253_channel[i].vm_id = vm_id;
+-		evtimer_set(&i8253_channel[i].timer, i8253_fire,
++		i8253_channel[i].timer = evtimer_new(evbase, i8253_fire,
+ 		    &i8253_channel[i]);
+ 		i8253_reset(i);
+ 	}
+@@ -387,7 +390,7 @@ i8253_stop()
+ {
+ 	int i;
+ 	for (i = 0; i < 3; i++)
+-		evtimer_del(&i8253_channel[i].timer);
++		evtimer_del(i8253_channel[i].timer);
+ }
+ 
+ void
+Index: i8253.h
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/i8253.h,v
+retrieving revision 1.9
+diff -u -p -u -p -r1.9 i8253.h
+--- i8253.h	26 Apr 2018 17:10:10 -0000	1.9
++++ i8253.h	24 May 2020 01:24:47 -0000
+@@ -37,7 +37,7 @@ struct i8253_channel {
+ 	uint8_t last_w;		/* last written byte (MSB/LSB) */
+ 	uint8_t mode;		/* counter mode */
+ 	uint8_t rbs;		/* channel is in readback status mode */
+-	struct event timer;	/* timer event for this counter */
++	struct event *timer;	/* timer event for this counter */
+ 	uint32_t vm_id;		/* owning VM id */
+ 	int in_use;		/* denotes if this counter was ever used */
+ 	uint8_t state;		/* 0 if channel is counting, 1 if fired */
+Index: mc146818.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/mc146818.c,v
+retrieving revision 1.21
+diff -u -p -u -p -r1.21 mc146818.c
+--- mc146818.c	30 Nov 2019 00:51:29 -0000	1.21
++++ mc146818.c	24 May 2020 01:24:47 -0000
+@@ -22,12 +22,14 @@
+ 
+ #include <machine/vmmvar.h>
+ 
+-#include <event.h>
+ #include <stddef.h>
+ #include <string.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
++#include <event2/event.h>
++#include <event2/event_struct.h>
++
+ #include "vmd.h"
+ #include "mc146818.h"
+ #include "proc.h"
+@@ -35,6 +37,8 @@
+ #include "vmm.h"
+ #include "atomicio.h"
+ 
++extern struct event_base *evbase;
++
+ #define MC_DIVIDER_MASK 0xe0
+ #define MC_RATE_MASK 0xf
+ 
+@@ -55,9 +59,9 @@ struct mc146818 {
+ 	uint8_t idx;
+ 	uint8_t regs[NVRAM_SIZE];
+ 	uint32_t vm_id;
+-	struct event sec;
++	struct event *sec;
+ 	struct timeval sec_tv;
+-	struct event per;
++	struct event *per;
+ 	struct timeval per_tv;
+ };
+ 
+@@ -110,7 +114,7 @@ rtc_fire1(int fd, short type, void *arg)
+ 		    "resync", __func__, (rtc.now - old));
+ 		vmmci_ctl(VMMCI_SYNCRTC);
+ 	}
+-	evtimer_add(&rtc.sec, &rtc.sec_tv);
++	evtimer_add(rtc.sec, &rtc.sec_tv);
+ }
+ 
+ /*
+@@ -131,7 +135,7 @@ rtc_fireper(int fd, short type, void *ar
+ 	vcpu_assert_pic_irq((ptrdiff_t)arg, 0, 8);
+ 	vcpu_deassert_pic_irq((ptrdiff_t)arg, 0, 8);
+ 
+-	evtimer_add(&rtc.per, &rtc.per_tv);
++	evtimer_add(rtc.per, &rtc.per_tv);
+ }
+ 
+ /*
+@@ -171,10 +175,10 @@ mc146818_init(uint32_t vm_id, uint64_t m
+ 
+ 	timerclear(&rtc.per_tv);
+ 
+-	evtimer_set(&rtc.sec, rtc_fire1, NULL);
+-	evtimer_add(&rtc.sec, &rtc.sec_tv);
++	rtc.sec = evtimer_new(evbase, rtc_fire1, NULL);
++	evtimer_add(rtc.sec, &rtc.sec_tv);
+ 
+-	evtimer_set(&rtc.per, rtc_fireper, (void *)(intptr_t)rtc.vm_id);
++	rtc.per = evtimer_new(evbase, rtc_fireper, (void *)(intptr_t)rtc.vm_id);
+ }
+ 
+ /*
+@@ -193,10 +197,10 @@ rtc_reschedule_per(void)
+ 		rate = 32768 >> ((rtc.regs[MC_REGA] & MC_RATE_MASK) - 1);
+ 		us = (1.0 / rate) * 1000000;
+ 		rtc.per_tv.tv_usec = us;
+-		if (evtimer_pending(&rtc.per, NULL))
+-			evtimer_del(&rtc.per);
++		if (evtimer_pending(rtc.per, NULL))
++			evtimer_del(rtc.per);
+ 
+-		evtimer_add(&rtc.per, &rtc.per_tv);
++		evtimer_add(rtc.per, &rtc.per_tv);
+ 	}
+ }
+ 
+@@ -340,21 +344,21 @@ mc146818_restore(int fd, uint32_t vm_id)
+ 
+ 	memset(&rtc.sec, 0, sizeof(struct event));
+ 	memset(&rtc.per, 0, sizeof(struct event));
+-	evtimer_set(&rtc.sec, rtc_fire1, NULL);
+-	evtimer_set(&rtc.per, rtc_fireper, (void *)(intptr_t)rtc.vm_id);
++	rtc.sec = evtimer_new(evbase, rtc_fire1, NULL);
++	rtc.per = evtimer_new(evbase, rtc_fireper, (void *)(intptr_t)rtc.vm_id);
+ 	return (0);
+ }
+ 
+ void
+ mc146818_stop()
+ {
+-	evtimer_del(&rtc.per);
+-	evtimer_del(&rtc.sec);
++	evtimer_del(rtc.per);
++	evtimer_del(rtc.sec);
+ }
+ 
+ void
+ mc146818_start()
+ {
+-	evtimer_add(&rtc.sec, &rtc.sec_tv);
++	evtimer_add(rtc.sec, &rtc.sec_tv);
+ 	rtc_reschedule_per();
+ }
+Index: ns8250.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/ns8250.c,v
+retrieving revision 1.25
+diff -u -p -u -p -r1.25 ns8250.c
+--- ns8250.c	11 Dec 2019 06:45:16 -0000	1.25
++++ ns8250.c	24 May 2020 01:24:48 -0000
+@@ -23,11 +23,13 @@
+ #include <machine/vmmvar.h>
+ 
+ #include <errno.h>
+-#include <event.h>
+ #include <pthread.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
++#include <event2/event.h>
++#include <event2/event_struct.h>
++
+ #include "ns8250.h"
+ #include "proc.h"
+ #include "vmd.h"
+@@ -35,6 +37,7 @@
+ #include "atomicio.h"
+ 
+ extern char *__progname;
++extern struct event_base *evbase;
+ struct ns8250_dev com1_dev;
+ 
+ static void com_rcv_event(int, short, void *);
+@@ -96,7 +99,7 @@ ns8250_init(int fd, uint32_t vmid)
+ 	 */
+ 	com1_dev.pause_ct = (com1_dev.baudrate / 8) / 1000 * 10;
+ 
+-	event_set(&com1_dev.event, com1_dev.fd, EV_READ | EV_PERSIST,
++	com1_dev.event = event_new(evbase, com1_dev.fd, EV_READ | EV_PERSIST,
+ 	    com_rcv_event, (void *)(intptr_t)vmid);
+ 
+ 	/*
+@@ -104,14 +107,14 @@ ns8250_init(int fd, uint32_t vmid)
+ 	 * Until then, avoid waiting for read events since EOF would constantly
+ 	 * be reached.
+ 	 */
+-	event_set(&com1_dev.wake, com1_dev.fd, EV_WRITE,
++	com1_dev.wake = event_new(evbase, com1_dev.fd, EV_WRITE,
+ 	    com_rcv_event, (void *)(intptr_t)vmid);
+-	event_add(&com1_dev.wake, NULL);
++	event_add(com1_dev.wake, NULL);
+ 
+ 	/* Rate limiter for simulating baud rate */
+ 	timerclear(&com1_dev.rate_tv);
+ 	com1_dev.rate_tv.tv_usec = 10000;
+-	evtimer_set(&com1_dev.rate, ratelimit, NULL);
++	com1_dev.rate = evtimer_new(evbase, ratelimit, NULL);
+ }
+ 
+ static void
+@@ -120,7 +123,7 @@ com_rcv_event(int fd, short kind, void *
+ 	mutex_lock(&com1_dev.mutex);
+ 
+ 	if (kind == EV_WRITE) {
+-		event_add(&com1_dev.event, NULL);
++		event_add(com1_dev.event, NULL);
+ 		mutex_unlock(&com1_dev.mutex);
+ 		return;
+ 	}
+@@ -201,8 +204,8 @@ com_rcv(struct ns8250_dev *com, uint32_t
+ 		if (errno != EAGAIN)
+ 			log_warn("unexpected read error on com device");
+ 	} else if (sz == 0) {
+-		event_del(&com->event);
+-		event_add(&com->wake, NULL);
++		event_del(com->event);
++		event_add(com->wake, NULL);
+ 		return;
+ 	} else if (sz != 1 && sz != 2)
+ 		log_warnx("unexpected read return value %zd on com device", sz);
+@@ -258,7 +261,7 @@ vcpu_process_com_data(struct vm_exit *ve
+ 			/* Limit output rate if needed */
+ 			if (com1_dev.pause_ct > 0 &&
+ 			    com1_dev.byte_out % com1_dev.pause_ct == 0) {
+-					evtimer_add(&com1_dev.rate,
++					evtimer_add(com1_dev.rate,
+ 					    &com1_dev.rate_tv);
+ 			} else {
+ 				/* Set TXRDY and clear "no pending interrupt" */
+@@ -656,12 +659,12 @@ ns8250_restore(int fd, int con_fd, uint3
+ 	com1_dev.baudrate = 115200;
+ 	com1_dev.rate_tv.tv_usec = 10000;
+ 	com1_dev.pause_ct = (com1_dev.baudrate / 8) / 1000 * 10;
+-	evtimer_set(&com1_dev.rate, ratelimit, NULL);
++	com1_dev.rate = evtimer_new(evbase, ratelimit, NULL);
+ 
+-	event_set(&com1_dev.event, com1_dev.fd, EV_READ | EV_PERSIST,
++	com1_dev.event = event_new(evbase, com1_dev.fd, EV_READ,
+ 	    com_rcv_event, (void *)(intptr_t)vmid);
+ 
+-	event_set(&com1_dev.wake, com1_dev.fd, EV_WRITE,
++	com1_dev.wake = event_new(evbase, com1_dev.fd, EV_WRITE,
+ 	    com_rcv_event, (void *)(intptr_t)vmid);
+ 
+ 	return (0);
+@@ -670,15 +673,15 @@ ns8250_restore(int fd, int con_fd, uint3
+ void
+ ns8250_stop()
+ {
+-	if(event_del(&com1_dev.event))
++	if(event_del(com1_dev.event))
+ 		log_warn("could not delete ns8250 event handler");
+-	evtimer_del(&com1_dev.rate);
++	evtimer_del(com1_dev.rate);
+ }
+ 
+ void
+ ns8250_start()
+ {
+-	event_add(&com1_dev.event, NULL);
+-	event_add(&com1_dev.wake, NULL);
+-	evtimer_add(&com1_dev.rate, &com1_dev.rate_tv);
++	event_add(com1_dev.event, NULL);
++	event_add(com1_dev.wake, NULL);
++	evtimer_add(com1_dev.rate, &com1_dev.rate_tv);
+ }
+Index: ns8250.h
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/ns8250.h,v
+retrieving revision 1.9
+diff -u -p -u -p -r1.9 ns8250.h
+--- ns8250.h	11 Dec 2019 06:45:16 -0000	1.9
++++ ns8250.h	24 May 2020 01:24:48 -0000
+@@ -62,9 +62,9 @@ struct ns8250_regs {
+ struct ns8250_dev {
+ 	pthread_mutex_t mutex;
+ 	struct ns8250_regs regs;
+-	struct event event;
+-	struct event rate;
+-	struct event wake;
++	struct event *event;
++	struct event *rate;
++	struct event *wake;
+ 	struct timeval rate_tv;
+ 	enum ns8250_portid portid;
+ 	int fd;
+Index: priv.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/priv.c,v
+retrieving revision 1.15
+diff -u -p -u -p -r1.15 priv.c
+--- priv.c	28 Jun 2019 13:32:51 -0000	1.15
++++ priv.c	24 May 2020 01:24:48 -0000
+@@ -34,7 +34,6 @@
+ #include <arpa/inet.h>
+ 
+ #include <errno.h>
+-#include <event.h>
+ #include <fcntl.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+Index: proc.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/proc.c,v
+retrieving revision 1.18
+diff -u -p -u -p -r1.18 proc.c
+--- proc.c	10 Sep 2018 10:36:01 -0000	1.18
++++ proc.c	24 May 2020 01:24:48 -0000
+@@ -31,11 +31,16 @@
+ #include <signal.h>
+ #include <paths.h>
+ #include <pwd.h>
+-#include <event.h>
+ #include <imsg.h>
++#include <assert.h>
++
++#include <event2/event.h>
++#include <event2/thread.h>
+ 
+ #include "proc.h"
+ 
++extern struct event_base *evbase;
++
+ void	 proc_exec(struct privsep *, struct privsep_proc *, unsigned int, int,
+ 	    int, char **);
+ void	 proc_setup(struct privsep *, struct privsep_proc *, unsigned int);
+@@ -183,9 +188,9 @@ proc_connect(struct privsep *ps)
+ 		for (inst = 0; inst < ps->ps_instances[dst]; inst++) {
+ 			iev = &ps->ps_ievs[dst][inst];
+ 			imsg_init(&iev->ibuf, ps->ps_pp->pp_pipes[dst][inst]);
+-			event_set(&iev->ev, iev->ibuf.fd, iev->events,
++			iev->ev = event_new(evbase, iev->ibuf.fd, iev->events,
+ 			    iev->handler, iev->data);
+-			event_add(&iev->ev, NULL);
++			event_add(iev->ev, NULL);
+ 		}
+ 	}
+ 
+@@ -196,6 +201,8 @@ proc_connect(struct privsep *ps)
+ 			if (src == PROC_PARENT || dst == PROC_PARENT)
+ 				continue;
+ 
++			log_debug("%s: going to proc_open src: %d, dest: %d",
++			    __func__, src, dst);
+ 			proc_open(ps, src, dst);
+ 		}
+ }
+@@ -287,10 +294,11 @@ proc_accept(struct privsep *ps, int fd, 
+ 	} else
+ 		pp->pp_pipes[dst][n] = fd;
+ 
++	log_debug("%s: %s accepted fd %d", __func__, *ps->ps_title, fd);
+ 	iev = &ps->ps_ievs[dst][n];
+ 	imsg_init(&iev->ibuf, fd);
+-	event_set(&iev->ev, iev->ibuf.fd, iev->events, iev->handler, iev->data);
+-	event_add(&iev->ev, NULL);
++	iev->ev = event_new(evbase, iev->ibuf.fd, iev->events, iev->handler, iev->data);
++	event_add(iev->ev, NULL);
+ }
+ 
+ void
+@@ -431,12 +439,16 @@ proc_open(struct privsep *ps, int src, i
+ 
+ 			pf.pf_procid = src;
+ 			pf.pf_instance = i;
++
++			log_debug("%s: sending pipe to dst procid %d", __func__, dst);
+ 			if (proc_compose_imsg(ps, dst, j, IMSG_CTL_PROCFD,
+ 			    -1, pb->pp_pipes[src][i], &pf, sizeof(pf)) == -1)
+ 				fatal("%s: proc_compose_imsg", __func__);
+ 
+ 			pf.pf_procid = dst;
+ 			pf.pf_instance = j;
++
++			log_debug("%s: sending pipe to src procid %d", __func__, src);
+ 			if (proc_compose_imsg(ps, src, i, IMSG_CTL_PROCFD,
+ 			    -1, pa->pp_pipes[dst][j], &pf, sizeof(pf)) == -1)
+ 				fatal("%s: proc_compose_imsg", __func__);
+@@ -463,6 +475,7 @@ proc_close(struct privsep *ps)
+ 
+ 	pp = ps->ps_pp;
+ 
++	log_debug("%s: title %s", __func__, *ps->ps_title);
+ 	for (dst = 0; dst < PROC_MAX; dst++) {
+ 		if (ps->ps_ievs[dst] == NULL)
+ 			continue;
+@@ -472,7 +485,7 @@ proc_close(struct privsep *ps)
+ 				continue;
+ 
+ 			/* Cancel the fd, close and invalidate the fd */
+-			event_del(&(ps->ps_ievs[dst][n].ev));
++			event_free(ps->ps_ievs[dst][n].ev);
+ 			imsg_clear(&(ps->ps_ievs[dst][n].ibuf));
+ 			close(pp->pp_pipes[dst][n]);
+ 			pp->pp_pipes[dst][n] = -1;
+@@ -501,6 +514,7 @@ proc_sig_handler(int sig, short event, v
+ {
+ 	struct privsep_proc	*p = arg;
+ 
++	log_debug("%s: %s got sig %d, event %d", __func__, p->p_title, sig, event);
+ 	switch (sig) {
+ 	case SIGINT:
+ 	case SIGTERM:
+@@ -566,21 +580,27 @@ proc_run(struct privsep *ps, struct priv
+ 	    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid))
+ 		fatal("%s: cannot drop privileges", __func__);
+ 
+-	event_init();
+-
+-	signal_set(&ps->ps_evsigint, SIGINT, proc_sig_handler, p);
+-	signal_set(&ps->ps_evsigterm, SIGTERM, proc_sig_handler, p);
+-	signal_set(&ps->ps_evsigchld, SIGCHLD, proc_sig_handler, p);
+-	signal_set(&ps->ps_evsighup, SIGHUP, proc_sig_handler, p);
+-	signal_set(&ps->ps_evsigpipe, SIGPIPE, proc_sig_handler, p);
+-	signal_set(&ps->ps_evsigusr1, SIGUSR1, proc_sig_handler, p);
+-
+-	signal_add(&ps->ps_evsigint, NULL);
+-	signal_add(&ps->ps_evsigterm, NULL);
+-	signal_add(&ps->ps_evsigchld, NULL);
+-	signal_add(&ps->ps_evsighup, NULL);
+-	signal_add(&ps->ps_evsigpipe, NULL);
+-	signal_add(&ps->ps_evsigusr1, NULL);
++	log_info("%s: %s has evbase: %p, %d current events",
++	    __func__, p->p_title, evbase,
++	    evbase ? event_base_get_num_events(evbase, EVENT_BASE_COUNT_ACTIVE) : -1);
++
++
++	evbase = event_base_new();
++	assert(evbase);
++
++	ps->ps_evsigint = evsignal_new(evbase, SIGINT, proc_sig_handler, p);
++	ps->ps_evsigterm = evsignal_new(evbase, SIGTERM, proc_sig_handler, p);
++	ps->ps_evsigchld = evsignal_new(evbase, SIGCHLD, proc_sig_handler, p);
++	ps->ps_evsighup = evsignal_new(evbase, SIGHUP, proc_sig_handler, p);
++	ps->ps_evsigpipe = evsignal_new(evbase, SIGPIPE, proc_sig_handler, p);
++	ps->ps_evsigusr1 = evsignal_new(evbase, SIGUSR1, proc_sig_handler, p);
++
++	evsignal_add(ps->ps_evsigint, NULL);
++	evsignal_add(ps->ps_evsigterm, NULL);
++	evsignal_add(ps->ps_evsigchld, NULL);
++	evsignal_add(ps->ps_evsighup, NULL);
++	evsignal_add(ps->ps_evsigpipe, NULL);
++	evsignal_add(ps->ps_evsigusr1, NULL);
+ 
+ 	proc_setup(ps, procs, nproc);
+ 	proc_accept(ps, PROC_PARENT_SOCK_FILENO, PROC_PARENT, 0);
+@@ -599,7 +619,7 @@ proc_run(struct privsep *ps, struct priv
+ 	if (run != NULL)
+ 		run(ps, p, arg);
+ 
+-	event_dispatch();
++	event_base_dispatch(evbase);
+ 
+ 	proc_shutdown(p);
+ }
+@@ -620,13 +640,17 @@ proc_dispatch(int fd, short event, void 
+ 	title = ps->ps_title[privsep_process];
+ 	ibuf = &iev->ibuf;
+ 
++	log_debug("%s: %s called fd: %d, event: %d", __func__, title, fd, event);
++
+ 	if (event & EV_READ) {
+ 		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
+ 			fatal("%s: imsg_read", __func__);
+ 		if (n == 0) {
++			log_debug("%s: dead pipe being read by %s, %d",
++			    __func__, title, p->p_id);
+ 			/* this pipe is dead, so remove the event handler */
+-			event_del(&iev->ev);
+-			event_loopexit(NULL);
++			event_free(iev->ev);
++			event_base_loopexit(evbase, NULL);
+ 			return;
+ 		}
+ 	}
+@@ -635,9 +659,11 @@ proc_dispatch(int fd, short event, void 
+ 		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
+ 			fatal("%s: msgbuf_write", __func__);
+ 		if (n == 0) {
++			log_debug("%s: dead pipe being written to by %s",
++			    __func__, title);
+ 			/* this pipe is dead, so remove the event handler */
+-			event_del(&iev->ev);
+-			event_loopexit(NULL);
++			event_free(iev->ev);
++			event_base_loopexit(evbase, NULL);
+ 			return;
+ 		}
+ 	}
+@@ -649,9 +675,9 @@ proc_dispatch(int fd, short event, void 
+ 			break;
+ 
+ #if DEBUG > 1
+-		log_debug("%s: %s %d got imsg %d peerid %d from %s %d",
++		log_debug("%s: %s (%d) got imsg (%d) from %s (peerid %d)",
+ 		    __func__, title, ps->ps_instance + 1,
+-		    imsg.hdr.type, imsg.hdr.peerid, p->p_title, imsg.hdr.pid);
++		    imsg.hdr.type, p->p_title, imsg.hdr.peerid);
+ #endif
+ 
+ 		/*
+@@ -712,9 +738,15 @@ imsg_event_add(struct imsgev *iev)
+ 	if (iev->ibuf.w.queued)
+ 		iev->events |= EV_WRITE;
+ 
+-	event_del(&iev->ev);
+-	event_set(&iev->ev, iev->ibuf.fd, iev->events, iev->handler, iev->data);
+-	event_add(&iev->ev, NULL);
++	if (iev->ev != NULL) {
++		log_debug("%s: seems we already have an event %p, freeing it.",
++		    __func__, iev->ev);
++		event_free(iev->ev);
++	}
++	// ??? Do we need to del it? Probably safe to...
++	// event_del(iev->ev);
++	iev->ev = event_new(evbase, iev->ibuf.fd, iev->events, iev->handler, iev->data);
++	event_add(iev->ev, NULL);
+ }
+ 
+ int
+@@ -723,6 +755,7 @@ imsg_compose_event(struct imsgev *iev, u
+ {
+ 	int	ret;
+ 
++	log_debug("%s: composing event type %d to peer %d", __func__, type, peerid);
+ 	if ((ret = imsg_compose(&iev->ibuf, type, peerid,
+ 	    pid, fd, data, datalen)) == -1)
+ 		return (ret);
+@@ -736,6 +769,7 @@ imsg_composev_event(struct imsgev *iev, 
+ {
+ 	int	ret;
+ 
++	log_debug("%s: composing iovec event type %d to peer %d", __func__, type, peerid);
+ 	if ((ret = imsg_composev(&iev->ibuf, type, peerid,
+ 	    pid, fd, iov, iovcnt)) == -1)
+ 		return (ret);
+Index: proc.h
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/proc.h,v
+retrieving revision 1.16
+diff -u -p -u -p -r1.16 proc.h
+--- proc.h	10 Sep 2018 10:36:01 -0000	1.16
++++ proc.h	24 May 2020 01:24:48 -0000
+@@ -21,7 +21,9 @@
+ #include <sys/uio.h>
+ 
+ #include <imsg.h>
+-#include <event.h>
++
++#include <event2/event.h>
++#include <event2/event_struct.h>
+ 
+ #ifndef _PROC_H
+ #define _PROC_H
+@@ -42,7 +44,7 @@ enum {
+ struct imsgev {
+ 	struct imsgbuf		 ibuf;
+ 	void			(*handler)(int, short, void *);
+-	struct event		 ev;
++	struct event		 *ev;
+ 	struct privsep_proc	*proc;
+ 	void			*data;
+ 	short			 events;
+@@ -57,8 +59,8 @@ struct imsgev {
+ /* control socket */
+ struct control_sock {
+ 	const char	*cs_name;
+-	struct event	 cs_ev;
+-	struct event	 cs_evt;
++	struct event	 *cs_ev;
++	struct event	 *cs_evt;
+ 	int		 cs_fd;
+ 	int		 cs_restricted;
+ 	void		*cs_env;
+@@ -118,12 +120,12 @@ struct privsep {
+ 	unsigned int			 ps_instance;
+ 
+ 	/* Event and signal handlers */
+-	struct event			 ps_evsigint;
+-	struct event			 ps_evsigterm;
+-	struct event			 ps_evsigchld;
+-	struct event			 ps_evsighup;
+-	struct event			 ps_evsigpipe;
+-	struct event			 ps_evsigusr1;
++	struct event			 *ps_evsigint;
++	struct event			 *ps_evsigterm;
++	struct event			 *ps_evsigchld;
++	struct event			 *ps_evsighup;
++	struct event			 *ps_evsigpipe;
++	struct event			 *ps_evsigusr1;
+ 
+ 	void				*ps_env;
+ };
+Index: virtio.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/virtio.c,v
+retrieving revision 1.82
+diff -u -p -u -p -r1.82 virtio.c
+--- virtio.c	11 Dec 2019 06:45:16 -0000	1.82
++++ virtio.c	24 May 2020 01:24:48 -0000
+@@ -32,13 +32,14 @@
+ #include <netinet/if_ether.h>
+ 
+ #include <errno.h>
+-#include <event.h>
+ #include <poll.h>
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
++#include <event2/event.h>
++
+ #include "pci.h"
+ #include "vmd.h"
+ #include "vmm.h"
+@@ -48,6 +49,7 @@
+ #include "atomicio.h"
+ 
+ extern char *__progname;
++extern struct event_base *evbase;
+ struct viornd_dev viornd;
+ struct vioblk_dev *vioblk;
+ struct vionet_dev *vionet;
+@@ -1587,7 +1589,7 @@ vmmci_ctl(unsigned int cmd)
+ 
+ 		/* Add ACK timeout */
+ 		tv.tv_sec = VMMCI_TIMEOUT;
+-		evtimer_add(&vmmci.timeout, &tv);
++		evtimer_add(vmmci.timeout, &tv);
+ 		break;
+ 	case VMMCI_SYNCRTC:
+ 		if (vmmci.cfg.guest_feature & VMMCI_F_SYNCRTC) {
+@@ -1627,7 +1629,7 @@ vmmci_ack(unsigned int cmd)
+ 			log_debug("%s: vm %u requested shutdown", __func__,
+ 			    vmmci.vm_id);
+ 			tv.tv_sec = VMMCI_TIMEOUT;
+-			evtimer_add(&vmmci.timeout, &tv);
++			evtimer_add(vmmci.timeout, &tv);
+ 			return;
+ 		}
+ 		/* FALLTHROUGH */
+@@ -1640,11 +1642,11 @@ vmmci_ack(unsigned int cmd)
+ 		 * killing it forcefully.
+ 		 */
+ 		if (cmd == vmmci.cmd &&
+-		    evtimer_pending(&vmmci.timeout, NULL)) {
++		    evtimer_pending(vmmci.timeout, NULL)) {
+ 			log_debug("%s: vm %u acknowledged shutdown request",
+ 			    __func__, vmmci.vm_id);
+ 			tv.tv_sec = VMMCI_SHUTDOWN_TIMEOUT;
+-			evtimer_add(&vmmci.timeout, &tv);
++			evtimer_add(vmmci.timeout, &tv);
+ 		}
+ 		break;
+ 	case VMMCI_SYNCRTC:
+@@ -1877,9 +1879,9 @@ virtio_init(struct vmd_vm *vm, int child
+ 			vionet[i].vm_vmid = vm->vm_vmid;
+ 			vionet[i].irq = pci_get_dev_irq(id);
+ 
+-			event_set(&vionet[i].event, vionet[i].fd,
++			vionet[i].event = event_new(evbase, vionet[i].fd,
+ 			    EV_READ | EV_PERSIST, vionet_rx_event, &vionet[i]);
+-			if (event_add(&vionet[i].event, NULL)) {
++			if (event_add(vionet[i].event, NULL)) {
+ 				log_warn("could not initialize vionet event "
+ 				    "handler");
+ 				return;
+@@ -2032,7 +2034,7 @@ virtio_init(struct vmd_vm *vm, int child
+ 	vmmci.irq = pci_get_dev_irq(id);
+ 	vmmci.pci_id = id;
+ 
+-	evtimer_set(&vmmci.timeout, vmmci_timeout, NULL);
++	vmmci.timeout = evtimer_new(evbase, vmmci_timeout, NULL);
+ }
+ 
+ void
+@@ -2064,8 +2066,7 @@ vmmci_restore(int fd, uint32_t vm_id)
+ 	}
+ 	vmmci.vm_id = vm_id;
+ 	vmmci.irq = pci_get_dev_irq(vmmci.pci_id);
+-	memset(&vmmci.timeout, 0, sizeof(struct event));
+-	evtimer_set(&vmmci.timeout, vmmci_timeout, NULL);
++	vmmci.timeout = evtimer_new(evbase, vmmci_timeout, NULL);
+ 	return (0);
+ }
+ 
+@@ -2138,7 +2139,7 @@ vionet_restore(int fd, struct vmd_vm *vm
+ 			vionet[i].irq = pci_get_dev_irq(vionet[i].pci_id);
+ 
+ 			memset(&vionet[i].event, 0, sizeof(struct event));
+-			event_set(&vionet[i].event, vionet[i].fd,
++			vionet[i].event = event_new(evbase, vionet[i].fd,
+ 			    EV_READ | EV_PERSIST, vionet_rx_event, &vionet[i]);
+ 		}
+ 	}
+@@ -2339,7 +2340,7 @@ virtio_stop(struct vm_create_params *vcp
+ {
+ 	uint8_t i;
+ 	for (i = 0; i < vcp->vcp_nnics; i++) {
+-		if (event_del(&vionet[i].event)) {
++		if (event_del(vionet[i].event)) {
+ 			log_warn("could not initialize vionet event "
+ 			    "handler");
+ 			return;
+@@ -2352,7 +2353,7 @@ virtio_start(struct vm_create_params *vc
+ {
+ 	uint8_t i;
+ 	for (i = 0; i < vcp->vcp_nnics; i++) {
+-		if (event_add(&vionet[i].event, NULL)) {
++		if (event_add(vionet[i].event, NULL)) {
+ 			log_warn("could not initialize vionet event "
+ 			    "handler");
+ 			return;
+Index: virtio.h
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/virtio.h,v
+retrieving revision 1.35
+diff -u -p -u -p -r1.35 virtio.h
+--- virtio.h	11 Dec 2019 06:45:16 -0000	1.35
++++ virtio.h	24 May 2020 01:24:48 -0000
+@@ -196,7 +196,7 @@ struct vioscsi_dev {
+ 
+ struct vionet_dev {
+ 	pthread_mutex_t mutex;
+-	struct event event;
++	struct event *event;
+ 
+ 	struct virtio_io_cfg cfg;
+ 
+@@ -242,7 +242,7 @@ enum vmmci_cmd {
+ 
+ struct vmmci_dev {
+ 	struct virtio_io_cfg cfg;
+-	struct event timeout;
++	struct event *timeout;
+ 	struct timeval time;
+ 	enum vmmci_cmd cmd;
+ 	uint32_t vm_id;
+Index: vm.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vm.c,v
+retrieving revision 1.57
+diff -u -p -u -p -r1.57 vm.c
+--- vm.c	30 Apr 2020 03:50:53 -0000	1.57
++++ vm.c	24 May 2020 01:24:48 -0000
+@@ -38,7 +38,6 @@
+ #include <net/if.h>
+ 
+ #include <errno.h>
+-#include <event.h>
+ #include <fcntl.h>
+ #include <imsg.h>
+ #include <limits.h>
+@@ -51,6 +50,9 @@
+ #include <unistd.h>
+ #include <util.h>
+ 
++#include <event2/event.h>
++#include <event2/thread.h>
++
+ #include "vmd.h"
+ #include "vmm.h"
+ #include "loadfile.h"
+@@ -118,6 +120,8 @@ pthread_mutex_t vcpu_unpause_mtx[VMM_MAX
+ uint8_t vcpu_hlt[VMM_MAX_VCPUS_PER_VM];
+ uint8_t vcpu_done[VMM_MAX_VCPUS_PER_VM];
+ 
++extern struct event_base *evbase;
++
+ /*
+  * Represents a standard register set for an OS to be booted
+  * as a flat 64 bit address space.
+@@ -364,8 +368,6 @@ start_vm(struct vmd_vm *vm, int fd)
+ 	for (i = 0; i < VMM_MAX_NICS_PER_VM; i++)
+ 		nicfds[i] = vm->vm_ifs[i].vif_fd;
+ 
+-	event_init();
+-
+ 	if (vm->vm_state & VM_STATE_RECEIVED) {
+ 		restore_emulated_hw(vcp, vm->vm_receive_fd, nicfds,
+ 		    vm->vm_disks, vm->vm_cdrom);
+@@ -1357,7 +1359,7 @@ event_thread(void *arg)
+ 	uint8_t *donep = arg;
+ 	intptr_t ret;
+ 
+-	ret = event_dispatch();
++	ret = event_base_dispatch(evbase);
+ 
+ 	mutex_lock(&threadmutex);
+ 	*donep = 1;
+Index: vmd.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vmd.c,v
+retrieving revision 1.117
+diff -u -p -u -p -r1.117 vmd.c
+--- vmd.c	12 Dec 2019 03:53:38 -0000	1.117
++++ vmd.c	24 May 2020 01:24:48 -0000
+@@ -31,7 +31,6 @@
+ #include <string.h>
+ #include <termios.h>
+ #include <errno.h>
+-#include <event.h>
+ #include <fcntl.h>
+ #include <pwd.h>
+ #include <signal.h>
+@@ -41,10 +40,13 @@
+ #include <ctype.h>
+ #include <pwd.h>
+ #include <grp.h>
++#include <assert.h>
+ 
+ #include <machine/specialreg.h>
+ #include <machine/vmmvar.h>
+ 
++#include <event2/event.h>
++
+ #include "proc.h"
+ #include "atomicio.h"
+ #include "vmd.h"
+@@ -75,7 +77,8 @@ static struct privsep_proc procs[] = {
+ 	{ "vmm",	PROC_VMM,	vmd_dispatch_vmm, vmm, vmm_shutdown },
+ };
+ 
+-struct event staggered_start_timer;
++struct event_base *evbase;
++static struct event *staggered_start_timer;
+ 
+ /* For the privileged process */
+ static struct privsep_proc *proc_priv = &procs[0];
+@@ -97,8 +100,11 @@ vmd_dispatch_control(int fd, struct priv
+ 	uint32_t			 id = 0;
+ 	struct control_sock		*rcs;
+ 
++	log_debug("%s: imsg hdr type: %d", __func__, imsg->hdr.type);
++
+ 	switch (imsg->hdr.type) {
+ 	case IMSG_VMDOP_START_VM_REQUEST:
++		log_debug("%s: start vm request", __func__);
+ 		IMSG_SIZE_CHECK(imsg, &vmc);
+ 		memcpy(&vmc, imsg->data, sizeof(vmc));
+ 		ret = vm_register(ps, &vmc, &vm, 0, vmc.vmc_owner.uid);
+@@ -119,9 +125,12 @@ vmd_dispatch_control(int fd, struct priv
+ 			res = errno;
+ 			cmd = IMSG_VMDOP_START_VM_RESPONSE;
+ 		}
++		log_debug("%s: start vm finish cmd: %d, res: %d",
++		    __func__, cmd, res);
+ 		break;
+ 	case IMSG_VMDOP_WAIT_VM_REQUEST:
+ 	case IMSG_VMDOP_TERMINATE_VM_REQUEST:
++		log_debug("%s: wait or terminate vm request", __func__);
+ 		IMSG_SIZE_CHECK(imsg, &vid);
+ 		memcpy(&vid, imsg->data, sizeof(vid));
+ 		flags = vid.vid_flags;
+@@ -163,6 +172,7 @@ vmd_dispatch_control(int fd, struct priv
+ 			return (-1);
+ 		break;
+ 	case IMSG_VMDOP_GET_INFO_VM_REQUEST:
++		log_debug("%s: get info vm request", __func__);
+ 		proc_forward_imsg(ps, imsg, PROC_VMM, -1);
+ 		break;
+ 	case IMSG_VMDOP_LOAD:
+@@ -728,6 +738,7 @@ main(int argc, char **argv)
+ 	int			 proc_instance = 0;
+ 	const char		*errp, *title = NULL;
+ 	int			 argc0 = argc;
++	int			 ret;
+ 
+ 	log_init(0, LOG_DAEMON);
+ 
+@@ -831,19 +842,20 @@ main(int argc, char **argv)
+ 	if (ps->ps_noaction == 0)
+ 		log_info("startup");
+ 
+-	event_init();
++	assert(evbase == NULL);
++	evbase = event_base_new();
+ 
+-	signal_set(&ps->ps_evsigint, SIGINT, vmd_sighdlr, ps);
+-	signal_set(&ps->ps_evsigterm, SIGTERM, vmd_sighdlr, ps);
+-	signal_set(&ps->ps_evsighup, SIGHUP, vmd_sighdlr, ps);
+-	signal_set(&ps->ps_evsigpipe, SIGPIPE, vmd_sighdlr, ps);
+-	signal_set(&ps->ps_evsigusr1, SIGUSR1, vmd_sighdlr, ps);
+-
+-	signal_add(&ps->ps_evsigint, NULL);
+-	signal_add(&ps->ps_evsigterm, NULL);
+-	signal_add(&ps->ps_evsighup, NULL);
+-	signal_add(&ps->ps_evsigpipe, NULL);
+-	signal_add(&ps->ps_evsigusr1, NULL);
++	ps->ps_evsigint = evsignal_new(evbase, SIGINT, vmd_sighdlr, ps);
++	ps->ps_evsigterm = evsignal_new(evbase, SIGTERM, vmd_sighdlr, ps);
++	ps->ps_evsighup = evsignal_new(evbase, SIGHUP, vmd_sighdlr, ps);
++	ps->ps_evsigpipe = evsignal_new(evbase, SIGPIPE, vmd_sighdlr, ps);
++	ps->ps_evsigusr1 = evsignal_new(evbase, SIGUSR1, vmd_sighdlr, ps);
++
++	evsignal_add(ps->ps_evsigint, NULL);
++	evsignal_add(ps->ps_evsigterm, NULL);
++	evsignal_add(ps->ps_evsighup, NULL);
++	evsignal_add(ps->ps_evsigpipe, NULL);
++	evsignal_add(ps->ps_evsigusr1, NULL);
+ 
+ 	if (!env->vmd_noaction)
+ 		proc_connect(ps);
+@@ -851,9 +863,9 @@ main(int argc, char **argv)
+ 	if (vmd_configure() == -1)
+ 		fatalx("configuration failed");
+ 
+-	event_dispatch();
++	ret = event_base_dispatch(evbase);
+ 
+-	log_debug("parent exiting");
++	log_debug("%s: parent exiting (%d)", __func__, ret);
+ 
+ 	return (0);
+ }
+@@ -875,7 +887,7 @@ start_vm_batch(int fd, short type, void 
+ 		}
+ 		i++;
+ 		if (i > env->vmd_cfg.parallelism) {
+-			evtimer_add(&staggered_start_timer,
++			evtimer_add(staggered_start_timer,
+ 			    &env->vmd_cfg.delay);
+ 			break;
+ 		}
+@@ -950,7 +962,7 @@ vmd_configure(void)
+ 	}
+ 
+ 	log_debug("%s: starting vms in staggered fashion", __func__);
+-	evtimer_set(&staggered_start_timer, start_vm_batch, NULL);
++	staggered_start_timer = evtimer_new(evbase, start_vm_batch, NULL);
+ 	/* start first batch */
+ 	start_vm_batch(0, 0, NULL);
+ 
+@@ -1020,7 +1032,7 @@ vmd_reload(unsigned int reset, const cha
+ 		}
+ 
+ 		log_debug("%s: starting vms in staggered fashion", __func__);
+-		evtimer_set(&staggered_start_timer, start_vm_batch, NULL);
++		staggered_start_timer = evtimer_new(evbase, start_vm_batch, NULL);
+ 		/* start first batch */
+ 		start_vm_batch(0, 0, NULL);
+ 
+@@ -1144,7 +1156,7 @@ vm_stop(struct vmd_vm *vm, int keeptty, 
+ 	user_put(vm->vm_user);
+ 
+ 	if (vm->vm_iev.ibuf.fd != -1) {
+-		event_del(&vm->vm_iev.ev);
++		event_del(vm->vm_iev.ev);
+ 		close(vm->vm_iev.ibuf.fd);
+ 	}
+ 	for (i = 0; i < VMM_MAX_DISKS_PER_VM; i++) {
+Index: vmm.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vmm.c,v
+retrieving revision 1.96
+diff -u -p -u -p -r1.96 vmm.c
+--- vmm.c	30 Apr 2020 03:50:53 -0000	1.96
++++ vmm.c	24 May 2020 01:24:48 -0000
+@@ -37,7 +37,6 @@
+ #include <net/if.h>
+ 
+ #include <errno.h>
+-#include <event.h>
+ #include <fcntl.h>
+ #include <imsg.h>
+ #include <limits.h>
+@@ -50,6 +49,8 @@
+ #include <unistd.h>
+ #include <util.h>
+ 
++#include <event2/event.h>
++#include <event2/thread.h>
+ #include "vmd.h"
+ #include "vmm.h"
+ 
+@@ -63,6 +64,7 @@ int get_info_vm(struct privsep *, struct
+ int opentap(char *);
+ 
+ extern struct vmd *env;
++extern struct event_base *evbase;
+ 
+ static struct privsep_proc procs[] = {
+ 	{ "parent",	PROC_PARENT,	vmm_dispatch_parent  },
+@@ -80,9 +82,9 @@ vmm_run(struct privsep *ps, struct privs
+ 	if (config_init(ps->ps_env) == -1)
+ 		fatal("failed to initialize configuration");
+ 
+-	signal_del(&ps->ps_evsigchld);
+-	signal_set(&ps->ps_evsigchld, SIGCHLD, vmm_sighdlr, ps);
+-	signal_add(&ps->ps_evsigchld, NULL);
++	evsignal_del(ps->ps_evsigchld);
++	ps->ps_evsigchld = evsignal_new(evbase, SIGCHLD, vmm_sighdlr, ps);
++	evsignal_add(ps->ps_evsigchld, NULL);
+ 
+ 	/*
+ 	 * pledge in the vmm process:
+@@ -198,7 +200,7 @@ vmm_dispatch_parent(int fd, struct privs
+ 				/*
+ 				 * Request reboot but mark the VM as shutting
+ 				 * down. This way we can terminate the VM after
+-				 * the triple fault instead of reboot and 
++				 * the triple fault instead of reboot and
+ 				 * avoid being stuck in the ACPI-less powerdown
+ 				 * ("press any key to reboot") of the VM.
+ 				 */
+@@ -469,6 +471,8 @@ vmm_pipe(struct vmd_vm *vm, int fd, void
+ {
+ 	struct imsgev	*iev = &vm->vm_iev;
+ 
++	log_debug("%s: setting up pipe fd %d for vm %d", __func__, fd, vm->vm_vmid);
++
+ 	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
+ 		log_warn("failed to set nonblocking mode on vm pipe");
+ 		return (-1);
+@@ -477,6 +481,7 @@ vmm_pipe(struct vmd_vm *vm, int fd, void
+ 	imsg_init(&iev->ibuf, fd);
+ 	iev->handler = cb;
+ 	iev->data = vm;
++
+ 	imsg_event_add(iev);
+ 
+ 	return (0);
+@@ -503,7 +508,7 @@ vmm_dispatch_vm(int fd, short event, voi
+ 			fatal("%s: imsg_read", __func__);
+ 		if (n == 0) {
+ 			/* this pipe is dead, so remove the event handler */
+-			event_del(&iev->ev);
++			event_del(iev->ev);
+ 			return;
+ 		}
+ 	}
+@@ -513,7 +518,7 @@ vmm_dispatch_vm(int fd, short event, voi
+ 			fatal("%s: msgbuf_write fd %d", __func__, ibuf->fd);
+ 		if (n == 0) {
+ 			/* this pipe is dead, so remove the event handler */
+-			event_del(&iev->ev);
++			event_del(iev->ev);
+ 			return;
+ 		}
+ 	}
+@@ -707,6 +712,18 @@ vmm_start_vm(struct imsg *imsg, uint32_t
+ 		return (0);
+ 	} else {
+ 		/* Child */
++
++		// We're inheriting an existing eventbase from our fork,
++		// it needs cleanup. event_reinit() is usually used, but
++		// since we're running in response to an existing event
++		// loop we need to exit it and make a new.
++		event_base_loopexit(evbase, NULL);
++		event_base_free(evbase);
++
++		evthread_enable_lock_debugging();
++		evthread_use_pthreads();
++		evbase = event_base_new();
++
+ 		close(fds[0]);
+ 		close(PROC_PARENT_SOCK_FILENO);
+ 

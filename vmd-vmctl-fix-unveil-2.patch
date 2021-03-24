@@ -1,0 +1,181 @@
+Index: usr.sbin/vmd/vioqcow2.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vioqcow2.c,v
+retrieving revision 1.14
+diff -u -p -u -p -r1.14 vioqcow2.c
+--- usr.sbin/vmd/vioqcow2.c	19 Oct 2020 19:06:49 -0000	1.14
++++ usr.sbin/vmd/vioqcow2.c	14 Mar 2021 03:37:57 -0000
+@@ -140,17 +140,13 @@ virtio_qcow2_init(struct virtio_backing 
+ 
+ /*
+  * Return the path to the base image given a disk image.
+- * Called from vmctl.
+  */
+ ssize_t
+-virtio_qcow2_get_base(int fd, char *path, size_t npath, const char *dpath)
++virtio_qcow2_get_base(int fd, char *path, size_t npath)
+ {
+-	char dpathbuf[PATH_MAX];
+-	char expanded[PATH_MAX];
+ 	struct qcheader header;
+ 	uint64_t backingoff;
+ 	uint32_t backingsz;
+-	char *s = NULL;
+ 
+ 	if (pread(fd, &header, sizeof(header), 0) != sizeof(header)) {
+ 		log_warnx("short read on header");
+@@ -175,11 +171,20 @@ virtio_qcow2_get_base(int fd, char *path
+ 	}
+ 	path[backingsz] = '\0';
+ 
+-	/*
+-	 * Relative paths should be interpreted relative to the disk image,
+-	 * rather than relative to the directory vmd happens to be running in,
+-	 * since this is the only userful interpretation.
+-	 */
++	return strlen(path);
++}
++
++/*
++ * Resolve the full path to a base image's path, translating any relative
++ * paths based on the provided directory path.
++ */
++ssize_t
++virtio_qcow2_resolve_path(char *path, size_t npath, const char *dpath)
++{
++	char dpathbuf[PATH_MAX];
++	char expanded[PATH_MAX];
++	char *s = NULL;
++
+ 	if (path[0] == '/') {
+ 		if (realpath(path, expanded) == NULL ||
+ 		    strlcpy(path, expanded, npath) >= npath) {
+@@ -729,7 +734,7 @@ virtio_qcow2_create(const char *imgfile_
+ 	if (ftruncate(fd, (off_t)initsz + clustersz) == -1)
+ 		goto error;
+ 
+-	/* 
++	/*
+ 	 * Paranoia: if our disk image takes more than one cluster
+ 	 * to refcount the initial image, fail.
+ 	 */
+Index: usr.sbin/vmd/virtio.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/virtio.c,v
+retrieving revision 1.82
+diff -u -p -u -p -r1.82 virtio.c
+--- usr.sbin/vmd/virtio.c	11 Dec 2019 06:45:16 -0000	1.82
++++ usr.sbin/vmd/virtio.c	14 Mar 2021 03:37:57 -0000
+@@ -1751,11 +1751,15 @@ vmmci_io(int dir, uint16_t reg, uint32_t
+ int
+ virtio_get_base(int fd, char *path, size_t npath, int type, const char *dpath)
+ {
++	int ret;
++
+ 	switch (type) {
+ 	case VMDF_RAW:
+ 		return 0;
+ 	case VMDF_QCOW2:
+-		return virtio_qcow2_get_base(fd, path, npath, dpath);
++		if ((ret = virtio_qcow2_get_base(fd, path, npath)) < 1)
++			return ret;
++		return virtio_qcow2_resolve_path(path, npath, dpath);
+ 	}
+ 	log_warnx("%s: invalid disk format", __func__);
+ 	return -1;
+Index: usr.sbin/vmd/virtio.h
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/virtio.h,v
+retrieving revision 1.36
+diff -u -p -u -p -r1.36 virtio.h
+--- usr.sbin/vmd/virtio.h	7 Jan 2021 17:11:38 -0000	1.36
++++ usr.sbin/vmd/virtio.h	14 Mar 2021 03:37:57 -0000
+@@ -274,7 +274,8 @@ void viornd_update_qs(void);
+ void viornd_update_qa(void);
+ int viornd_notifyq(void);
+ 
+-ssize_t virtio_qcow2_get_base(int, char *, size_t, const char *);
++ssize_t virtio_qcow2_get_base(int, char *, size_t);
++ssize_t virtio_qcow2_resolve_path(char *, size_t, const char *);
+ int virtio_qcow2_create(const char *, const char *, long);
+ int virtio_qcow2_init(struct virtio_backing *, off_t *, int*, size_t);
+ int virtio_raw_create(const char *, long);
+Index: usr.sbin/vmctl/vmctl.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmctl/vmctl.c,v
+retrieving revision 1.76
+diff -u -p -u -p -r1.76 vmctl.c
+--- usr.sbin/vmctl/vmctl.c	27 Jan 2021 07:21:12 -0000	1.76
++++ usr.sbin/vmctl/vmctl.c	14 Mar 2021 03:37:57 -0000
+@@ -29,6 +29,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <imsg.h>
++#include <libgen.h>
+ #include <limits.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -864,6 +865,8 @@ open_imagefile(int type, const char *img
+ {
+ 	int	 fd, ret, basefd[VM_MAX_BASE_PER_DISK], nfd, i;
+ 	char	 path[PATH_MAX];
++	char	 resolved[PATH_MAX];
++	char    *dir = NULL;
+ 
+ 	*sz = 0;
+ 	if ((fd = open(imgfile_path, flags)) == -1)
+@@ -879,21 +882,42 @@ open_imagefile(int type, const char *img
+ 			return (-1);
+ 		for (i = 0; i < VM_MAX_BASE_PER_DISK - 1; i++, nfd++) {
+ 			if ((ret = virtio_qcow2_get_base(basefd[i],
+-			    path, sizeof(path), imgfile_path)) == -1) {
++			    path, sizeof(path))) == -1) {
+ 				log_debug("%s: failed to get base %d", __func__, i);
+ 				return -1;
+ 			} else if (ret == 0)
+ 				break;
+ 
+ 			/*
+-			 * This might be called after unveil is already
+-			 * locked but it is save to ignore the EPERM error
+-			 * here as the subsequent open would fail as well.
++			 * We need to find a potential unveil path. If the base
++			 * image looks like an absolute path, just use it. If
++			 * it isn't, unveil it with respect to the directory of
++			 * the source disk image.
+ 			 */
+-			if ((ret = unveil(path, "r")) != 0 &&
+-			    (ret != EPERM))
++			if (path[0] == '/') {
++				if (strlcpy(resolved, path, sizeof(resolved)) >=
++				    sizeof(resolved))
++			    return (-1);
++			} else {
++				if (strlcpy(resolved, imgfile_path,
++					sizeof(resolved)) >= sizeof(resolved)) {
++					log_warnx("path too long: %s",
++					    imgfile_path);
++					return -1;
++				}
++				dir = dirname(resolved);
++				if (snprintf(resolved, sizeof(resolved), "%s/%s",
++					dir, path) >= (int)sizeof(resolved)) {
++					log_warnx("path too long: %s/%s",
++					    dir, path);
++					return -1;
++				}
++			}
++
++			if ((ret = unveil(resolved, "r")) != 0)
+ 				err(1, "unveil");
+-			if ((basefd[i + 1] = open(path, O_RDONLY)) == -1) {
++
++			if ((basefd[i + 1] = open(resolved, O_RDONLY)) == -1) {
+ 				log_warn("%s: failed to open base %s",
+ 				    __func__, path);
+ 				return (-1);
+@@ -951,4 +975,3 @@ create_imagefile(int type, const char *i
+ 
+ 	return (ret);
+ }
+-

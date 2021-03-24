@@ -1,0 +1,17 @@
+Index: vioqcow2.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vioqcow2.c,v
+retrieving revision 1.14
+diff -u -p -u -p -r1.14 vioqcow2.c
+--- vioqcow2.c	19 Oct 2020 19:06:49 -0000	1.14
++++ vioqcow2.c	13 Mar 2021 13:45:56 -0000
+@@ -175,6 +175,9 @@ virtio_qcow2_get_base(int fd, char *path
+ 	}
+ 	path[backingsz] = '\0';
+ 
++	if (unveil(path, "r") != 0)
++		err(1, "unveil");
++
+ 	/*
+ 	 * Relative paths should be interpreted relative to the disk image,
+ 	 * rather than relative to the directory vmd happens to be running in,

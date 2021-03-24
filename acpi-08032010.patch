@@ -1,0 +1,342 @@
+? acpi.c
+? acpi.h
+Index: Makefile
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/Makefile,v
+retrieving revision 1.24
+diff -u -p -u -p -r1.24 Makefile
+--- Makefile	23 Sep 2020 19:18:18 -0000	1.24
++++ Makefile	9 Mar 2021 01:55:56 -0000
+@@ -7,6 +7,7 @@ SRCS=		vmd.c control.c log.c priv.c proc
+ SRCS+=		vm.c loadfile_elf.c pci.c virtio.c i8259.c mc146818.c
+ SRCS+=		ns8250.c i8253.c vmboot.c ufs.c disklabel.c dhcp.c packet.c
+ SRCS+=		parse.y atomicio.c vioscsi.c vioraw.c vioqcow2.c fw_cfg.c
++SRCS+=		acpi.c
+ 
+ CFLAGS+=	-Wall -I${.CURDIR}
+ CFLAGS+=	-Wstrict-prototypes -Wmissing-prototypes
+Index: fw_cfg.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/fw_cfg.c,v
+retrieving revision 1.2
+diff -u -p -u -p -r1.2 fw_cfg.c
+--- fw_cfg.c	11 Oct 2019 15:25:40 -0000	1.2
++++ fw_cfg.c	9 Mar 2021 01:55:56 -0000
+@@ -17,11 +17,13 @@
+ #include <sys/types.h>
+ #include <sys/uio.h>
+ #include <machine/vmmvar.h>
++#include <dev/acpi/acpireg.h>
+ 
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
++#include "acpi.h"
+ #include "atomicio.h"
+ #include "proc.h"
+ #include "vmd.h"
+@@ -31,8 +33,12 @@
+ #define	FW_CFG_SIGNATURE	0x0000
+ #define	FW_CFG_ID		0x0001
+ #define	FW_CFG_NOGRAPHIC	0x0004
++#define FW_CFG_NB_CPUS		0x0005
++#define FW_CFG_MAX_CPUS		0x000f
+ #define	FW_CFG_FILE_DIR		0x0019
+ #define	FW_CFG_FILE_FIRST	0x0020
++#define FW_CFG_ARCH_LOCAL	0x8000
++#define FW_CFG_ACPI_TABLES	(FW_CFG_ARCH_LOCAL + 0)
+ 
+ #define FW_CFG_DMA_SIGNATURE	0x51454d5520434647ULL /* QEMU CFG */
+ 
+@@ -73,6 +79,14 @@ fw_cfg_init(struct vmop_create_params *v
+ 	const char *bootorder = NULL;
+ 	unsigned int sd = 0;
+ 
++	struct acpi_rsdp1 *rsdp;
++	struct acpi_rsdt *rsdt;
++	struct acpi_fadt *fadt;
++	struct acpi_dsdt_x *dsdt;
++	struct loader_entry cmds[11] = {{0}, {0}, {0}, {0},
++					{0}, {0}, {0}, {0},
++					{0}, {0}, {0}};
++
+ 	/* do not double print chars on serial port */
+ 	fw_cfg_add_file("etc/screen-and-debug", &sd, sizeof(sd));
+ 
+@@ -90,6 +104,90 @@ fw_cfg_init(struct vmop_create_params *v
+ 	}
+ 	if (bootorder)
+ 		fw_cfg_add_file("bootorder", bootorder, strlen(bootorder) + 1);
++
++	/* XXX ACPI HACKING
++	   1. add all tables via "etc/acpi/tables" file
++	   2. configure "etc/table-loader" with commands:
++	     a. alloc
++	   3. add RSDP file "etc/acpi/rsdp"
++	*/
++	rsdp = init_rsdp();
++	rsdt = init_rsdt();
++	fadt = init_fadt();
++	dsdt = init_dsdt();
++
++	// ALLOCATE
++	cmds[0].command = LOADER_COMMAND_ALLOCATE;
++	strlcpy(cmds[0].alloc.file, ACPI_BUILD_RSDP_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[0].alloc.align = 16;
++	cmds[0].alloc.zone = LOADER_ALLOC_ZONE_FSEG;
++
++	cmds[1].command = LOADER_COMMAND_ALLOCATE;
++	strlcpy(cmds[1].alloc.file, ACPI_BUILD_RSDT_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[1].alloc.align = 4096;
++	cmds[1].alloc.zone = LOADER_ALLOC_ZONE_HIGH;
++
++	cmds[2].command = LOADER_COMMAND_ALLOCATE;
++	strlcpy(cmds[2].alloc.file, ACPI_BUILD_FADT_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[2].alloc.align = 4096;
++	cmds[2].alloc.zone = LOADER_ALLOC_ZONE_HIGH;
++
++	cmds[3].command = LOADER_COMMAND_ALLOCATE;
++	strlcpy(cmds[3].alloc.file, ACPI_BUILD_DSDT_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[3].alloc.align = 4096;
++	cmds[3].alloc.zone = LOADER_ALLOC_ZONE_HIGH;
++
++	// LINK
++
++	cmds[4].command = LOADER_COMMAND_ADD_POINTER;
++	strlcpy(cmds[4].pointer.dest_file, ACPI_BUILD_RSDP_FILE, ROM_MAX_FILENAME_LEN);
++	strlcpy(cmds[4].pointer.src_file, ACPI_BUILD_RSDT_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[4].pointer.offset = 16;
++	cmds[4].pointer.size = 4;
++
++	cmds[5].command = LOADER_COMMAND_ADD_POINTER;
++	strlcpy(cmds[5].pointer.dest_file, ACPI_BUILD_RSDT_FILE, ROM_MAX_FILENAME_LEN);
++	strlcpy(cmds[5].pointer.src_file, ACPI_BUILD_FADT_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[5].pointer.offset = 36;
++	cmds[5].pointer.size = 4;
++
++	cmds[6].command = LOADER_COMMAND_ADD_POINTER;
++	strlcpy(cmds[6].pointer.dest_file, ACPI_BUILD_FADT_FILE, ROM_MAX_FILENAME_LEN);
++	strlcpy(cmds[6].pointer.src_file, ACPI_BUILD_DSDT_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[6].pointer.offset = VMD_FADT_POINTER_DSDT_OFFSET;
++	cmds[6].pointer.size = 4;
++
++	// CHECKSUMS
++
++	cmds[7].command = LOADER_COMMAND_ADD_CHECKSUM;
++	strlcpy(cmds[7].cksum.file, ACPI_BUILD_RSDP_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[7].cksum.length = 20;
++	cmds[7].cksum.offset = 8;
++	cmds[7].cksum.start = 0;
++
++	cmds[8].command = LOADER_COMMAND_ADD_CHECKSUM;
++	strlcpy(cmds[8].cksum.file, ACPI_BUILD_RSDT_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[8].cksum.length = rsdt->hdr.length;
++	cmds[8].cksum.offset = 9;
++	cmds[8].cksum.start = 0;
++
++	cmds[9].command = LOADER_COMMAND_ADD_CHECKSUM;
++	strlcpy(cmds[9].cksum.file, ACPI_BUILD_FADT_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[9].cksum.length = fadt->hdr.length;
++	cmds[9].cksum.offset = 9;
++	cmds[9].cksum.start = 0;
++
++	cmds[10].command = LOADER_COMMAND_ADD_CHECKSUM;
++	strlcpy(cmds[10].cksum.file, ACPI_BUILD_DSDT_FILE, ROM_MAX_FILENAME_LEN);
++	cmds[10].cksum.length = dsdt->hdr.length;
++	cmds[10].cksum.offset = 9;
++	cmds[10].cksum.start = 0;
++
++	fw_cfg_add_file(ACPI_BUILD_RSDT_FILE, rsdt, sizeof(struct acpi_rsdt));
++	fw_cfg_add_file(ACPI_BUILD_FADT_FILE, fadt, VMD_FADT_LEN);
++	fw_cfg_add_file(ACPI_BUILD_DSDT_FILE, dsdt, dsdt->hdr.length);
++	fw_cfg_add_file(FW_CFG_TABLE_LOADER_FILE, &cmds, sizeof(cmds));
++	fw_cfg_add_file(ACPI_BUILD_RSDP_FILE, rsdp, sizeof(struct acpi_rsdp1));
+ }
+ 
+ int
+@@ -179,6 +277,8 @@ fw_cfg_select(uint16_t selector)
+ 	uint16_t one = 1;
+ 	uint32_t id = htole32(0x3);
+ 
++	printf("%s: called with 0x%04X\n", __func__, selector);
++
+ 	fw_cfg_reset_state();
+ 	switch (selector) {
+ 	case FW_CFG_SIGNATURE:
+@@ -190,6 +290,9 @@ fw_cfg_select(uint16_t selector)
+ 	case FW_CFG_NOGRAPHIC:
+ 		fw_cfg_set_state(&one, sizeof(one));
+ 		break;
++	case FW_CFG_NB_CPUS:
++		fw_cfg_set_state(&one, sizeof(one));
++		break;
+ 	case FW_CFG_FILE_DIR:
+ 		fw_cfg_file_dir();
+ 		break;
+@@ -257,12 +360,12 @@ vcpu_exit_fw_cfg(struct vm_run_params *v
+ 			set_return_data(vei, 0);
+ 			break;
+ 		}
+-		log_debug("%s: selector 0x%04x", __func__, data);
++		log_info("%s: selector 0x%04x", __func__, data);
+ 		fw_cfg_select(data);
+ 		break;
+ 	case FW_CFG_IO_DATA:
+ 		if (vei->vei.vei_dir == VEI_DIR_OUT) {
+-			log_debug("%s: fw_cfg: discarding data written to "
++			log_info("%s: fw_cfg: discarding data written to "
+ 			    "data port", __progname);
+ 			break;
+ 		}
+@@ -288,7 +391,7 @@ vcpu_exit_fw_cfg_dma(struct vm_run_param
+ 	struct vm_exit *vei = vrp->vrp_exit;
+ 
+ 	if (vei->vei.vei_size != 4) {
+-		log_debug("%s: fw_cfg_dma: discarding data written to "
++		log_info("%s: fw_cfg_dma: discarding data written to "
+ 		    "dma addr", __progname);
+ 		if (vei->vei.vei_dir == VEI_DIR_OUT)
+ 			fw_cfg_dma_addr = 0;
+@@ -365,6 +468,8 @@ fw_cfg_add_file(const char *name, const 
+ {
+ 	struct fw_cfg_file_entry *f;
+ 
++	printf("%s: adding %s, len %lu\n", __func__, name, len);
++
+ 	if (fw_cfg_lookup_file(name))
+ 		fatalx("%s: fw_cfg: file %s exists", __progname, name);
+ 
+@@ -382,6 +487,8 @@ fw_cfg_add_file(const char *name, const 
+ 	f->file.selector = htobe16(file_id++);
+ 	memcpy(f->data, data, len);
+ 
++	printf("added rom file %s\n", name);
++
+ 	TAILQ_INSERT_TAIL(&fw_cfg_files, f, entry);
+ }
+ 
+@@ -395,7 +502,7 @@ fw_cfg_select_file(uint16_t id)
+ 		if (f->file.selector == id) {
+ 			size_t size = be32toh(f->file.size);
+ 			fw_cfg_set_state(f->data, size);
+-			log_debug("%s: accessing file %s", __func__,
++			log_info("%s: accessing file %s", __func__,
+ 			    f->file.name);
+ 			return 1;
+ 		}
+@@ -420,7 +527,7 @@ fw_cfg_file_dir(void)
+ 	*data = htobe32(count);
+ 	fp = (struct fw_cfg_file *)(data + 1);
+ 
+-	log_debug("%s: file directory with %d files", __func__, count);
++	log_info("%s: file directory with %d files", __func__, count);
+ 	TAILQ_FOREACH(f, &fw_cfg_files, entry) {
+ 		log_debug("  %6dB %04x %s", be32toh(f->file.size),
+ 		    be16toh(f->file.selector), f->file.name);
+Index: fw_cfg.h
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/fw_cfg.h,v
+retrieving revision 1.1
+diff -u -p -u -p -r1.1 fw_cfg.h
+--- fw_cfg.h	10 Dec 2018 21:30:33 -0000	1.1
++++ fw_cfg.h	9 Mar 2021 01:55:56 -0000
+@@ -15,10 +15,98 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ 
++#include <sys/types.h>
++
+ #define	FW_CFG_IO_SELECT	0x510
+ #define	FW_CFG_IO_DATA		0x511
+ #define	FW_CFG_IO_DMA_ADDR_HIGH	0x514
+ #define	FW_CFG_IO_DMA_ADDR_LOW	0x518
++
++#define ACPI_BUILD_RSDP_FILE "etc/acpi/rsdp"
++#define ACPI_BUILD_RSDT_FILE "etc/acpi/rsdt"
++#define ACPI_BUILD_FADT_FILE "etc/acpi/fadt"
++#define ACPI_BUILD_DSDT_FILE "etc/acpi/dsdt"
++
++#define FW_CFG_TABLE_LOADER_FILE "etc/table-loader"
++
++#define ROM_MAX_FILENAME_LEN	56
++
++enum loader_cmd {
++    LOADER_COMMAND_ALLOCATE      = 0x1,
++    LOADER_COMMAND_ADD_POINTER   = 0x2,
++    LOADER_COMMAND_ADD_CHECKSUM  = 0x3,
++    LOADER_COMMAND_WRITE_POINTER = 0x4,
++};
++
++enum loader_alloc_zone {
++    LOADER_ALLOC_ZONE_HIGH = 0x1,
++    LOADER_ALLOC_ZONE_FSEG = 0x2,
++};
++
++struct loader_entry {
++    uint32_t command;
++    union {
++        /*
++         * COMMAND_ALLOCATE - allocate a table from @alloc.file
++         * subject to @alloc.align alignment (must be power of 2)
++         * and @alloc.zone (can be HIGH or FSEG) requirements.
++         *
++         * Must appear exactly once for each file, and before
++         * this file is referenced by any other command.
++         */
++        struct {
++            char file[ROM_MAX_FILENAME_LEN];
++            uint32_t align;
++            uint8_t zone;
++        } alloc;
++
++        /*
++         * COMMAND_ADD_POINTER - patch the table (originating from
++         * @dest_file) at @pointer.offset, by adding a pointer to the table
++         * originating from @src_file. 1,2,4 or 8 byte unsigned
++         * addition is used depending on @pointer.size.
++         */
++        struct {
++            char dest_file[ROM_MAX_FILENAME_LEN];
++            char src_file[ROM_MAX_FILENAME_LEN];
++            uint32_t offset;
++            uint8_t size;
++        } pointer;
++
++        /*
++         * COMMAND_ADD_CHECKSUM - calculate checksum of the range specified by
++         * @cksum.start and @cksum.length fields,
++         * and then add the value at @cksum_offset.
++         * Checksum simply sums -X for each byte X in the range
++         * using 8-bit math.
++         */
++        struct {
++            char file[ROM_MAX_FILENAME_LEN];
++            uint32_t offset;
++            uint32_t start;
++            uint32_t length;
++        } cksum;
++
++        /*
++         * COMMAND_WRITE_POINTER - Write back to a host file via DMA,
++         * @wr_pointer.dest_file at offset @wr_pointer.dst_offset, a pointer
++         * to the table originating from @wr_pointer.src_file at offset
++         * @wr_pointer.src_offset.
++         * 1,2,4 or 8 byte unsigned addition is used depending on
++         * @wr_pointer.size.
++         */
++        struct {
++            char dest_file[ROM_MAX_FILENAME_LEN];
++            char src_file[ROM_MAX_FILENAME_LEN];
++            uint32_t dst_offset;
++            uint32_t src_offset;
++            uint8_t size;
++        } wr_pointer;
++
++        /* padding */
++        char pad[124];
++    };
++};
+ 
+ void	fw_cfg_init(struct vmop_create_params *);
+ int	fw_cfg_dump(int);

@@ -1,0 +1,2911 @@
+Index: sys/arch/amd64/include/vmmvar.h
+===================================================================
+RCS file: /cvs/src/sys/arch/amd64/include/vmmvar.h,v
+retrieving revision 1.70
+diff -u -p -u -p -r1.70 vmmvar.h
+--- sys/arch/amd64/include/vmmvar.h	8 Apr 2020 07:39:48 -0000	1.70
++++ sys/arch/amd64/include/vmmvar.h	16 Mar 2021 12:07:47 -0000
+@@ -322,7 +322,9 @@ enum {
+ };
+ 
+ enum {
+-	VEE_FAULT_PROTECT
++	VEE_FAULT_REGULAR,
++	VEE_FAULT_PROTECT,
++	VEE_MMIO_ASSIST
+ };
+ 
+ enum {
+@@ -359,6 +361,9 @@ struct vm_exit_inout {
+  */
+ struct vm_exit_eptviolation {
+ 	uint8_t		vee_fault_type;
++	uint64_t	gpa;
++	uint8_t		insn_len;
++	uint8_t		insn_bytes[15];
+ };
+ 
+ /*
+@@ -626,10 +631,16 @@ struct vm_mprotect_ept_params {
+     CPUIDECX_SDBG | CPUIDECX_XTPR | CPUIDECX_PCID | \
+     CPUIDECX_DCA | CPUIDECX_X2APIC | CPUIDECX_DEADLINE)
+ #define VMM_ECPUIDECX_MASK ~(CPUIDECX_SVM | CPUIDECX_MWAITX)
++#define VMM_CPUIDEDX_MASK ~(CPUID_TM | \
++    CPUID_HTT | CPUID_DS | CPUID_APIC | \
++    CPUID_PSN | CPUID_SS | CPUID_PBE | \
++    CPUID_MTRR | CPUID_MCE | CPUID_MCA)
++/*
+ #define VMM_CPUIDEDX_MASK ~(CPUID_ACPI | CPUID_TM | \
+     CPUID_HTT | CPUID_DS | CPUID_APIC | \
+     CPUID_PSN | CPUID_SS | CPUID_PBE | \
+     CPUID_MTRR | CPUID_MCE | CPUID_MCA)
++*/
+ #define VMM_AMDSPEC_EBX_MASK ~(CPUIDEBX_IBPB | CPUIDEBX_IBRS | \
+     CPUIDEBX_STIBP | CPUIDEBX_IBRS_ALWAYSON | CPUIDEBX_STIBP_ALWAYSON | \
+     CPUIDEBX_IBRS_PREF | CPUIDEBX_SSBD | CPUIDEBX_VIRT_SSBD | \
+@@ -704,6 +715,7 @@ enum {
+ 
+ enum {
+ 	VMM_MEM_TYPE_REGULAR,
++	VMM_MEM_TYPE_MMIO,
+ 	VMM_MEM_TYPE_UNKNOWN
+ };
+ 
+Index: sys/arch/amd64/amd64/vmm.c
+===================================================================
+RCS file: /cvs/src/sys/arch/amd64/amd64/vmm.c,v
+retrieving revision 1.278
+diff -u -p -u -p -r1.278 vmm.c
+--- sys/arch/amd64/amd64/vmm.c	11 Mar 2021 11:16:55 -0000	1.278
++++ sys/arch/amd64/amd64/vmm.c	16 Mar 2021 12:07:47 -0000
+@@ -1447,8 +1447,8 @@ vm_create(struct vm_create_params *vcp, 
+ 		return (EINVAL);
+ 
+ 	/* XXX - support UP only (for now) */
+-	if (vcp->vcp_ncpus != 1)
+-		return (EINVAL);
++	//if (vcp->vcp_ncpus != 1)
++	//	return (EINVAL);
+ 
+ 	vm = pool_get(&vm_pool, PR_WAITOK | PR_ZERO);
+ 	SLIST_INIT(&vm->vm_vcpu_list);
+@@ -5172,6 +5172,9 @@ vmx_handle_exit(struct vcpu *vcpu)
+ 		break;
+ 	case VMX_EXIT_EPT_VIOLATION:
+ 		ret = vmx_handle_np_fault(vcpu);
++		if (ret == EAGAIN) {
++			update_rip = 1;
++		}
+ 		break;
+ 	case VMX_EXIT_CPUID:
+ 		ret = vmm_handle_cpuid(vcpu);
+@@ -5352,7 +5355,7 @@ vmm_get_guest_memtype(struct vm *vm, pad
+ 
+ 	if (gpa >= VMM_PCI_MMIO_BAR_BASE && gpa <= VMM_PCI_MMIO_BAR_END) {
+ 		DPRINTF("guest mmio access @ 0x%llx\n", (uint64_t)gpa);
+-		return (VMM_MEM_TYPE_REGULAR);
++		return (VMM_MEM_TYPE_MMIO);
+ 	}
+ 
+ 	/* XXX Use binary search? */
+@@ -5488,6 +5491,9 @@ svm_handle_np_fault(struct vcpu *vcpu)
+ 	case VMM_MEM_TYPE_REGULAR:
+ 		ret = svm_fault_page(vcpu, gpa);
+ 		break;
++	case VMM_MEM_TYPE_MMIO:
++		/* XXX Unsupported */
++		return (EINVAL);
+ 	default:
+ 		printf("unknown memory type %d for GPA 0x%llx\n",
+ 		    gpa_memtype, gpa);
+@@ -5530,7 +5536,7 @@ vmx_fault_page(struct vcpu *vcpu, paddr_
+ int
+ vmx_handle_np_fault(struct vcpu *vcpu)
+ {
+-	uint64_t gpa;
++	uint64_t gpa, insn_length;
+ 	int gpa_memtype, ret;
+ 
+ 	ret = 0;
+@@ -5538,12 +5544,28 @@ vmx_handle_np_fault(struct vcpu *vcpu)
+ 		printf("%s: cannot extract faulting pa\n", __func__);
+ 		return (EINVAL);
+ 	}
++	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
++		printf("%s: can't obtain instruction length\n", __func__);
++		return (EINVAL);
++	}
++
+ 
+ 	gpa_memtype = vmm_get_guest_memtype(vcpu->vc_parent, gpa);
+ 	switch (gpa_memtype) {
+ 	case VMM_MEM_TYPE_REGULAR:
++		vcpu->vc_exit.vee.vee_fault_type = VEE_FAULT_REGULAR;
+ 		ret = vmx_fault_page(vcpu, gpa);
+ 		break;
++	case VMM_MEM_TYPE_MMIO:
++		printf("%s: mmio %lld byte insn @ 0x%llx\n", __func__,
++		    insn_length, vcpu->vc_gueststate.vg_rip);
++		vcpu->vc_gueststate.vg_rip += insn_length;
++
++		vcpu->vc_exit.vee.vee_fault_type = VEE_MMIO_ASSIST;
++		vcpu->vc_exit.vee.gpa = gpa;
++		vcpu->vc_exit.vee.insn_len = insn_length;
++
++		return (EAGAIN);
+ 	default:
+ 		printf("unknown memory type %d for GPA 0x%llx\n",
+ 		    gpa_memtype, gpa);
+Index: usr.sbin/vmd/Makefile
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/Makefile,v
+retrieving revision 1.24
+diff -u -p -u -p -r1.24 Makefile
+--- usr.sbin/vmd/Makefile	23 Sep 2020 19:18:18 -0000	1.24
++++ usr.sbin/vmd/Makefile	16 Mar 2021 12:07:47 -0000
+@@ -7,6 +7,7 @@ SRCS=		vmd.c control.c log.c priv.c proc
+ SRCS+=		vm.c loadfile_elf.c pci.c virtio.c i8259.c mc146818.c
+ SRCS+=		ns8250.c i8253.c vmboot.c ufs.c disklabel.c dhcp.c packet.c
+ SRCS+=		parse.y atomicio.c vioscsi.c vioraw.c vioqcow2.c fw_cfg.c
++SRCS+=		mmio.c
+ 
+ CFLAGS+=	-Wall -I${.CURDIR}
+ CFLAGS+=	-Wstrict-prototypes -Wmissing-prototypes
+Index: usr.sbin/vmd/mmio.c
+===================================================================
+RCS file: usr.sbin/vmd/mmio.c
+diff -N usr.sbin/vmd/mmio.c
+--- /dev/null	1 Jan 1970 00:00:00 -0000
++++ usr.sbin/vmd/mmio.c	16 Mar 2021 12:07:47 -0000
+@@ -0,0 +1,2412 @@
++/*	$NetBSD: libnvmm_x86.c,v 1.43 2020/12/27 20:56:14 reinoud Exp $	*/
++
++/*
++ * Copyright (c) 2018-2020 Maxime Villard, m00nbsd.net
++ * All rights reserved.
++ *
++ * This code is part of the NVMM hypervisor.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#include <sys/cdefs.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++
++#include <stdbool.h>
++
++#include <machine/param.h>
++#include <machine/psl.h>
++#include <machine/specialreg.h>
++#include <machine/vmmvar.h>
++#include <sys/mman.h>
++
++#include "mmio.h"
++#include "vmd.h"
++
++// TODO
++struct nvmm_vcpu;
++struct nvmm_mem;
++struct nvmm_x64_state;
++
++/* -------------------------------------------------------------------------- */
++
++#define DISASSEMBLER_BUG()	\
++	do {			\
++		errno = EINVAL;	\
++		return -1;	\
++	} while (0);
++
++
++static inline uint64_t
++size_to_mask(size_t size)
++{
++	switch (size) {
++	case 1:
++		return 0x00000000000000FF;
++	case 2:
++		return 0x000000000000FFFF;
++	case 4:
++		return 0x00000000FFFFFFFF;
++	case 8:
++	default:
++		return 0xFFFFFFFFFFFFFFFF;
++	}
++}
++
++/* -------------------------------------------------------------------------- */
++
++struct x86_emul {
++	bool readreg;
++	bool backprop;
++	bool notouch;
++	void (*func)(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++};
++
++static void x86_func_or(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++static void x86_func_and(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++static void x86_func_xchg(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++static void x86_func_sub(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++static void x86_func_xor(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++static void x86_func_cmp(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++static void x86_func_test(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++static void x86_func_mov(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++static void x86_func_stos(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++static void x86_func_lods(struct nvmm_vcpu *, struct nvmm_mem *, uint64_t *);
++
++static const struct x86_emul x86_emul_or = {
++	.readreg = true,
++	.func = x86_func_or
++};
++
++static const struct x86_emul x86_emul_and = {
++	.readreg = true,
++	.func = x86_func_and
++};
++
++static const struct x86_emul x86_emul_xchg = {
++	.readreg = true,
++	.backprop = true,
++	.func = x86_func_xchg
++};
++
++static const struct x86_emul x86_emul_sub = {
++	.readreg = true,
++	.func = x86_func_sub
++};
++
++static const struct x86_emul x86_emul_xor = {
++	.readreg = true,
++	.func = x86_func_xor
++};
++
++static const struct x86_emul x86_emul_cmp = {
++	.notouch = true,
++	.func = x86_func_cmp
++};
++
++static const struct x86_emul x86_emul_test = {
++	.notouch = true,
++	.func = x86_func_test
++};
++
++static const struct x86_emul x86_emul_mov = {
++	.func = x86_func_mov
++};
++
++static const struct x86_emul x86_emul_stos = {
++	.func = x86_func_stos
++};
++
++static const struct x86_emul x86_emul_lods = {
++	.func = x86_func_lods
++};
++
++/* Legacy prefixes. */
++#define LEG_LOCK	0xF0
++#define LEG_REPN	0xF2
++#define LEG_REP		0xF3
++#define LEG_OVR_CS	0x2E
++#define LEG_OVR_SS	0x36
++#define LEG_OVR_DS	0x3E
++#define LEG_OVR_ES	0x26
++#define LEG_OVR_FS	0x64
++#define LEG_OVR_GS	0x65
++#define LEG_OPR_OVR	0x66
++#define LEG_ADR_OVR	0x67
++
++struct x86_legpref {
++	bool opr_ovr:1;
++	bool adr_ovr:1;
++	bool rep:1;
++	bool repn:1;
++	bool repe:1;
++	int8_t seg;
++};
++
++struct x86_rexpref {
++	bool b:1;
++	bool x:1;
++	bool r:1;
++	bool w:1;
++	bool present:1;
++};
++
++struct x86_reg {
++	int num;	/* NVMM GPR state index */
++	uint64_t mask;
++};
++
++struct x86_dualreg {
++	int reg1;
++	int reg2;
++};
++
++enum x86_disp_type {
++	DISP_NONE,
++	DISP_0,
++	DISP_1,
++	DISP_2,
++	DISP_4
++};
++
++struct x86_disp {
++	enum x86_disp_type type;
++	uint64_t data; /* 4 bytes, but can be sign-extended */
++};
++
++struct x86_regmodrm {
++	uint8_t mod:2;
++	uint8_t reg:3;
++	uint8_t rm:3;
++};
++
++struct x86_immediate {
++	uint64_t data;
++};
++
++struct x86_sib {
++	uint8_t scale;
++	const struct x86_reg *idx;
++	const struct x86_reg *bas;
++};
++
++enum x86_store_type {
++	STORE_NONE,
++	STORE_REG,
++	STORE_DUALREG,
++	STORE_IMM,
++	STORE_SIB,
++	STORE_DMO
++};
++
++struct x86_store {
++	enum x86_store_type type;
++	union {
++		const struct x86_reg *reg;
++		struct x86_dualreg dualreg;
++		struct x86_immediate imm;
++		struct x86_sib sib;
++		uint64_t dmo;
++	} u;
++	struct x86_disp disp;
++	int hardseg;
++};
++
++struct x86_instr {
++	uint8_t len;
++	struct x86_legpref legpref;
++	struct x86_rexpref rexpref;
++	struct x86_regmodrm regmodrm;
++	uint8_t operand_size;
++	uint8_t address_size;
++	uint64_t zeroextend_mask;
++
++	const struct x86_opcode *opcode;
++	const struct x86_emul *emul;
++
++	struct x86_store src;
++	struct x86_store dst;
++	struct x86_store *strm;
++};
++
++struct x86_decode_fsm {
++	/* vcpu */
++	bool is64bit;
++	bool is32bit;
++	bool is16bit;
++
++	/* fsm */
++	int (*fn)(struct x86_decode_fsm *, struct x86_instr *);
++	uint8_t *buf;
++	uint8_t *end;
++};
++
++struct x86_opcode {
++	bool valid:1;
++	bool regmodrm:1;
++	bool regtorm:1;
++	bool dmo:1;
++	bool todmo:1;
++	bool movs:1;
++	bool cmps:1;
++	bool stos:1;
++	bool lods:1;
++	bool szoverride:1;
++	bool group1:1;
++	bool group3:1;
++	bool group11:1;
++	bool immediate:1;
++	uint8_t defsize;
++	uint8_t flags;
++	const struct x86_emul *emul;
++};
++
++struct x86_group_entry {
++	const struct x86_emul *emul;
++};
++
++#define OPSIZE_BYTE 0x01
++#define OPSIZE_WORD 0x02 /* 2 bytes */
++#define OPSIZE_DOUB 0x04 /* 4 bytes */
++#define OPSIZE_QUAD 0x08 /* 8 bytes */
++
++#define FLAG_imm8	0x01
++#define FLAG_immz	0x02
++#define FLAG_ze		0x04
++
++static const struct x86_group_entry group1[8] = {
++	[1] = { .emul = &x86_emul_or },
++	[4] = { .emul = &x86_emul_and },
++	[6] = { .emul = &x86_emul_xor },
++	[7] = { .emul = &x86_emul_cmp }
++};
++
++static const struct x86_group_entry group3[8] = {
++	[0] = { .emul = &x86_emul_test },
++	[1] = { .emul = &x86_emul_test }
++};
++
++static const struct x86_group_entry group11[8] = {
++	[0] = { .emul = &x86_emul_mov }
++};
++
++static const struct x86_opcode primary_opcode_table[256] = {
++	/*
++	 * Group1
++	 */
++	[0x80] = {
++		/* Eb, Ib */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.group1 = true,
++		.immediate = true,
++		.emul = NULL /* group1 */
++	},
++	[0x81] = {
++		/* Ev, Iz */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.group1 = true,
++		.immediate = true,
++		.flags = FLAG_immz,
++		.emul = NULL /* group1 */
++	},
++	[0x83] = {
++		/* Ev, Ib */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.group1 = true,
++		.immediate = true,
++		.flags = FLAG_imm8,
++		.emul = NULL /* group1 */
++	},
++
++	/*
++	 * Group3
++	 */
++	[0xF6] = {
++		/* Eb, Ib */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.group3 = true,
++		.immediate = true,
++		.emul = NULL /* group3 */
++	},
++	[0xF7] = {
++		/* Ev, Iz */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.group3 = true,
++		.immediate = true,
++		.flags = FLAG_immz,
++		.emul = NULL /* group3 */
++	},
++
++	/*
++	 * Group11
++	 */
++	[0xC6] = {
++		/* Eb, Ib */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.group11 = true,
++		.immediate = true,
++		.emul = NULL /* group11 */
++	},
++	[0xC7] = {
++		/* Ev, Iz */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.group11 = true,
++		.immediate = true,
++		.flags = FLAG_immz,
++		.emul = NULL /* group11 */
++	},
++
++	/*
++	 * OR
++	 */
++	[0x08] = {
++		/* Eb, Gb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_or
++	},
++	[0x09] = {
++		/* Ev, Gv */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_or
++	},
++	[0x0A] = {
++		/* Gb, Eb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_or
++	},
++	[0x0B] = {
++		/* Gv, Ev */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_or
++	},
++
++	/*
++	 * AND
++	 */
++	[0x20] = {
++		/* Eb, Gb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_and
++	},
++	[0x21] = {
++		/* Ev, Gv */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_and
++	},
++	[0x22] = {
++		/* Gb, Eb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_and
++	},
++	[0x23] = {
++		/* Gv, Ev */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_and
++	},
++
++	/*
++	 * SUB
++	 */
++	[0x28] = {
++		/* Eb, Gb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_sub
++	},
++	[0x29] = {
++		/* Ev, Gv */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_sub
++	},
++	[0x2A] = {
++		/* Gb, Eb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_sub
++	},
++	[0x2B] = {
++		/* Gv, Ev */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_sub
++	},
++
++	/*
++	 * XOR
++	 */
++	[0x30] = {
++		/* Eb, Gb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_xor
++	},
++	[0x31] = {
++		/* Ev, Gv */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_xor
++	},
++	[0x32] = {
++		/* Gb, Eb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_xor
++	},
++	[0x33] = {
++		/* Gv, Ev */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_xor
++	},
++
++	/*
++	 * XCHG
++	 */
++	[0x86] = {
++		/* Eb, Gb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_xchg
++	},
++	[0x87] = {
++		/* Ev, Gv */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_xchg
++	},
++
++	/*
++	 * MOV
++	 */
++	[0x88] = {
++		/* Eb, Gb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_mov
++	},
++	[0x89] = {
++		/* Ev, Gv */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_mov
++	},
++	[0x8A] = {
++		/* Gb, Eb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_mov
++	},
++	[0x8B] = {
++		/* Gv, Ev */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_mov
++	},
++	[0xA0] = {
++		/* AL, Ob */
++		.valid = true,
++		.dmo = true,
++		.todmo = false,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_mov
++	},
++	[0xA1] = {
++		/* rAX, Ov */
++		.valid = true,
++		.dmo = true,
++		.todmo = false,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_mov
++	},
++	[0xA2] = {
++		/* Ob, AL */
++		.valid = true,
++		.dmo = true,
++		.todmo = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_mov
++	},
++	[0xA3] = {
++		/* Ov, rAX */
++		.valid = true,
++		.dmo = true,
++		.todmo = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_mov
++	},
++
++	/*
++	 * MOVS
++	 */
++	[0xA4] = {
++		/* Yb, Xb */
++		.valid = true,
++		.movs = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = NULL
++	},
++	[0xA5] = {
++		/* Yv, Xv */
++		.valid = true,
++		.movs = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = NULL
++	},
++
++	/*
++	 * CMPS
++	 */
++	[0xA6] = {
++		/* Yb, Xb */
++		.valid = true,
++		.cmps = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = NULL
++	},
++	[0xA7] = {
++		/* Yv, Xv */
++		.valid = true,
++		.cmps = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = NULL
++	},
++
++	/*
++	 * STOS
++	 */
++	[0xAA] = {
++		/* Yb, AL */
++		.valid = true,
++		.stos = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_stos
++	},
++	[0xAB] = {
++		/* Yv, rAX */
++		.valid = true,
++		.stos = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_stos
++	},
++
++	/*
++	 * LODS
++	 */
++	[0xAC] = {
++		/* AL, Xb */
++		.valid = true,
++		.lods = true,
++		.szoverride = false,
++		.defsize = OPSIZE_BYTE,
++		.emul = &x86_emul_lods
++	},
++	[0xAD] = {
++		/* rAX, Xv */
++		.valid = true,
++		.lods = true,
++		.szoverride = true,
++		.defsize = -1,
++		.emul = &x86_emul_lods
++	},
++};
++
++static const struct x86_opcode secondary_opcode_table[256]  = {
++	/*
++	 * MOVZX
++	 */
++	[0xB6] = {
++		/* Gv, Eb */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = true,
++		.defsize = OPSIZE_BYTE,
++		.flags = FLAG_ze,
++		.emul = &x86_emul_mov
++	},
++	[0xB7] = {
++		/* Gv, Ew */
++		.valid = true,
++		.regmodrm = true,
++		.regtorm = false,
++		.szoverride = true,
++		.defsize = OPSIZE_WORD,
++		.flags = FLAG_ze,
++		.emul = &x86_emul_mov
++	},
++};
++
++static const struct x86_reg gpr_map__rip = { NVMM_X64_GPR_RIP, 0xFFFFFFFFFFFFFFFF };
++
++/* [REX-present][enc][opsize] */
++static const struct x86_reg gpr_map__special[2][4][8]  = {
++	[false] = {
++		/* No REX prefix. */
++		[0b00] = {
++			[0] = { NVMM_X64_GPR_RAX, 0x000000000000FF00 }, /* AH */
++			[1] = { NVMM_X64_GPR_RSP, 0x000000000000FFFF }, /* SP */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RSP, 0x00000000FFFFFFFF }, /* ESP */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { -1, 0 },
++		},
++		[0b01] = {
++			[0] = { NVMM_X64_GPR_RCX, 0x000000000000FF00 }, /* CH */
++			[1] = { NVMM_X64_GPR_RBP, 0x000000000000FFFF }, /* BP */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RBP, 0x00000000FFFFFFFF },	/* EBP */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { -1, 0 },
++		},
++		[0b10] = {
++			[0] = { NVMM_X64_GPR_RDX, 0x000000000000FF00 }, /* DH */
++			[1] = { NVMM_X64_GPR_RSI, 0x000000000000FFFF }, /* SI */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RSI, 0x00000000FFFFFFFF }, /* ESI */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { -1, 0 },
++		},
++		[0b11] = {
++			[0] = { NVMM_X64_GPR_RBX, 0x000000000000FF00 }, /* BH */
++			[1] = { NVMM_X64_GPR_RDI, 0x000000000000FFFF }, /* DI */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RDI, 0x00000000FFFFFFFF }, /* EDI */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { -1, 0 },
++		}
++	},
++	[true] = {
++		/* Has REX prefix. */
++		[0b00] = {
++			[0] = { NVMM_X64_GPR_RSP, 0x00000000000000FF }, /* SPL */
++			[1] = { NVMM_X64_GPR_RSP, 0x000000000000FFFF }, /* SP */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RSP, 0x00000000FFFFFFFF }, /* ESP */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_RSP, 0xFFFFFFFFFFFFFFFF }, /* RSP */
++		},
++		[0b01] = {
++			[0] = { NVMM_X64_GPR_RBP, 0x00000000000000FF }, /* BPL */
++			[1] = { NVMM_X64_GPR_RBP, 0x000000000000FFFF }, /* BP */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RBP, 0x00000000FFFFFFFF }, /* EBP */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_RBP, 0xFFFFFFFFFFFFFFFF }, /* RBP */
++		},
++		[0b10] = {
++			[0] = { NVMM_X64_GPR_RSI, 0x00000000000000FF }, /* SIL */
++			[1] = { NVMM_X64_GPR_RSI, 0x000000000000FFFF }, /* SI */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RSI, 0x00000000FFFFFFFF }, /* ESI */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_RSI, 0xFFFFFFFFFFFFFFFF }, /* RSI */
++		},
++		[0b11] = {
++			[0] = { NVMM_X64_GPR_RDI, 0x00000000000000FF }, /* DIL */
++			[1] = { NVMM_X64_GPR_RDI, 0x000000000000FFFF }, /* DI */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RDI, 0x00000000FFFFFFFF }, /* EDI */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_RDI, 0xFFFFFFFFFFFFFFFF }, /* RDI */
++		}
++	}
++};
++
++/* [depends][enc][size] */
++static const struct x86_reg gpr_map[2][8][8] = {
++	[false] = {
++		/* Not extended. */
++		[0b000] = {
++			[0] = { NVMM_X64_GPR_RAX, 0x00000000000000FF }, /* AL */
++			[1] = { NVMM_X64_GPR_RAX, 0x000000000000FFFF }, /* AX */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RAX, 0x00000000FFFFFFFF }, /* EAX */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_RAX, 0xFFFFFFFFFFFFFFFF }, /* RAX */
++		},
++		[0b001] = {
++			[0] = { NVMM_X64_GPR_RCX, 0x00000000000000FF }, /* CL */
++			[1] = { NVMM_X64_GPR_RCX, 0x000000000000FFFF }, /* CX */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RCX, 0x00000000FFFFFFFF }, /* ECX */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_RCX, 0xFFFFFFFFFFFFFFFF }, /* RCX */
++		},
++		[0b010] = {
++			[0] = { NVMM_X64_GPR_RDX, 0x00000000000000FF }, /* DL */
++			[1] = { NVMM_X64_GPR_RDX, 0x000000000000FFFF }, /* DX */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RDX, 0x00000000FFFFFFFF }, /* EDX */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_RDX, 0xFFFFFFFFFFFFFFFF }, /* RDX */
++		},
++		[0b011] = {
++			[0] = { NVMM_X64_GPR_RBX, 0x00000000000000FF }, /* BL */
++			[1] = { NVMM_X64_GPR_RBX, 0x000000000000FFFF }, /* BX */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_RBX, 0x00000000FFFFFFFF }, /* EBX */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_RBX, 0xFFFFFFFFFFFFFFFF }, /* RBX */
++		},
++		[0b100] = {
++			[0] = { -1, 0 }, /* SPECIAL */
++			[1] = { -1, 0 }, /* SPECIAL */
++			[2] = { -1, 0 },
++			[3] = { -1, 0 }, /* SPECIAL */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { -1, 0 }, /* SPECIAL */
++		},
++		[0b101] = {
++			[0] = { -1, 0 }, /* SPECIAL */
++			[1] = { -1, 0 }, /* SPECIAL */
++			[2] = { -1, 0 },
++			[3] = { -1, 0 }, /* SPECIAL */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { -1, 0 }, /* SPECIAL */
++		},
++		[0b110] = {
++			[0] = { -1, 0 }, /* SPECIAL */
++			[1] = { -1, 0 }, /* SPECIAL */
++			[2] = { -1, 0 },
++			[3] = { -1, 0 }, /* SPECIAL */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { -1, 0 }, /* SPECIAL */
++		},
++		[0b111] = {
++			[0] = { -1, 0 }, /* SPECIAL */
++			[1] = { -1, 0 }, /* SPECIAL */
++			[2] = { -1, 0 },
++			[3] = { -1, 0 }, /* SPECIAL */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { -1, 0 }, /* SPECIAL */
++		},
++	},
++	[true] = {
++		/* Extended. */
++		[0b000] = {
++			[0] = { NVMM_X64_GPR_R8, 0x00000000000000FF }, /* R8B */
++			[1] = { NVMM_X64_GPR_R8, 0x000000000000FFFF }, /* R8W */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_R8, 0x00000000FFFFFFFF }, /* R8D */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_R8, 0xFFFFFFFFFFFFFFFF }, /* R8 */
++		},
++		[0b001] = {
++			[0] = { NVMM_X64_GPR_R9, 0x00000000000000FF }, /* R9B */
++			[1] = { NVMM_X64_GPR_R9, 0x000000000000FFFF }, /* R9W */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_R9, 0x00000000FFFFFFFF }, /* R9D */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_R9, 0xFFFFFFFFFFFFFFFF }, /* R9 */
++		},
++		[0b010] = {
++			[0] = { NVMM_X64_GPR_R10, 0x00000000000000FF }, /* R10B */
++			[1] = { NVMM_X64_GPR_R10, 0x000000000000FFFF }, /* R10W */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_R10, 0x00000000FFFFFFFF }, /* R10D */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_R10, 0xFFFFFFFFFFFFFFFF }, /* R10 */
++		},
++		[0b011] = {
++			[0] = { NVMM_X64_GPR_R11, 0x00000000000000FF }, /* R11B */
++			[1] = { NVMM_X64_GPR_R11, 0x000000000000FFFF }, /* R11W */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_R11, 0x00000000FFFFFFFF }, /* R11D */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_R11, 0xFFFFFFFFFFFFFFFF }, /* R11 */
++		},
++		[0b100] = {
++			[0] = { NVMM_X64_GPR_R12, 0x00000000000000FF }, /* R12B */
++			[1] = { NVMM_X64_GPR_R12, 0x000000000000FFFF }, /* R12W */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_R12, 0x00000000FFFFFFFF }, /* R12D */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_R12, 0xFFFFFFFFFFFFFFFF }, /* R12 */
++		},
++		[0b101] = {
++			[0] = { NVMM_X64_GPR_R13, 0x00000000000000FF }, /* R13B */
++			[1] = { NVMM_X64_GPR_R13, 0x000000000000FFFF }, /* R13W */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_R13, 0x00000000FFFFFFFF }, /* R13D */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_R13, 0xFFFFFFFFFFFFFFFF }, /* R13 */
++		},
++		[0b110] = {
++			[0] = { NVMM_X64_GPR_R14, 0x00000000000000FF }, /* R14B */
++			[1] = { NVMM_X64_GPR_R14, 0x000000000000FFFF }, /* R14W */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_R14, 0x00000000FFFFFFFF }, /* R14D */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_R14, 0xFFFFFFFFFFFFFFFF }, /* R14 */
++		},
++		[0b111] = {
++			[0] = { NVMM_X64_GPR_R15, 0x00000000000000FF }, /* R15B */
++			[1] = { NVMM_X64_GPR_R15, 0x000000000000FFFF }, /* R15W */
++			[2] = { -1, 0 },
++			[3] = { NVMM_X64_GPR_R15, 0x00000000FFFFFFFF }, /* R15D */
++			[4] = { -1, 0 },
++			[5] = { -1, 0 },
++			[6] = { -1, 0 },
++			[7] = { NVMM_X64_GPR_R15, 0xFFFFFFFFFFFFFFFF }, /* R15 */
++		},
++	}
++};
++
++/* [enc] */
++static const int gpr_dual_reg1_rm[8] = {
++	[0b000] = NVMM_X64_GPR_RBX, /* BX (+SI) */
++	[0b001] = NVMM_X64_GPR_RBX, /* BX (+DI) */
++	[0b010] = NVMM_X64_GPR_RBP, /* BP (+SI) */
++	[0b011] = NVMM_X64_GPR_RBP, /* BP (+DI) */
++	[0b100] = NVMM_X64_GPR_RSI, /* SI */
++	[0b101] = NVMM_X64_GPR_RDI, /* DI */
++	[0b110] = NVMM_X64_GPR_RBP, /* BP */
++	[0b111] = NVMM_X64_GPR_RBX, /* BX */
++};
++
++static int
++node_overflow(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	fsm->fn = NULL;
++	return -1;
++}
++
++static int
++fsm_read(struct x86_decode_fsm *fsm, uint8_t *bytes, size_t n)
++{
++	if (fsm->buf + n > fsm->end) {
++		return -1;
++	}
++	memcpy(bytes, fsm->buf, n);
++	return 0;
++}
++
++static inline void
++fsm_advance(struct x86_decode_fsm *fsm, size_t n,
++    int (*fn)(struct x86_decode_fsm *, struct x86_instr *))
++{
++	fsm->buf += n;
++	if (fsm->buf > fsm->end) {
++		fsm->fn = node_overflow;
++	} else {
++		fsm->fn = fn;
++	}
++}
++
++static const struct x86_reg *
++resolve_special_register(struct x86_instr *instr, uint8_t enc, size_t regsize)
++{
++	enc &= 0b11;
++	if (regsize == 8) {
++		/* May be 64bit without REX */
++		return &gpr_map__special[1][enc][regsize-1];
++	}
++	return &gpr_map__special[instr->rexpref.present][enc][regsize-1];
++}
++
++/*
++ * Special node, for MOVS. Fake two displacements of zero on the source and
++ * destination registers.
++ */
++static int
++node_movs(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	size_t adrsize;
++
++	adrsize = instr->address_size;
++
++	/* DS:RSI */
++	instr->src.type = STORE_REG;
++	instr->src.u.reg = &gpr_map__special[1][2][adrsize-1];
++	instr->src.disp.type = DISP_0;
++
++	/* ES:RDI, force ES */
++	instr->dst.type = STORE_REG;
++	instr->dst.u.reg = &gpr_map__special[1][3][adrsize-1];
++	instr->dst.disp.type = DISP_0;
++	instr->dst.hardseg = NVMM_X64_SEG_ES;
++
++	fsm_advance(fsm, 0, NULL);
++
++	return 0;
++}
++
++/*
++ * Special node, for CMPS. Fake two displacements of zero on the source and
++ * destination registers.
++ * XXX coded as clone of movs as its similar in register usage
++ * XXX might be merged with node_movs()
++ */
++static int
++node_cmps(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	size_t adrsize;
++
++	adrsize = instr->address_size;
++
++	/* DS:RSI */
++	instr->src.type = STORE_REG;
++	instr->src.u.reg = &gpr_map__special[1][2][adrsize-1];
++	instr->src.disp.type = DISP_0;
++
++	/* ES:RDI, force ES */
++	instr->dst.type = STORE_REG;
++	instr->dst.u.reg = &gpr_map__special[1][3][adrsize-1];
++	instr->dst.disp.type = DISP_0;
++	instr->dst.hardseg = NVMM_X64_SEG_ES;
++
++	fsm_advance(fsm, 0, NULL);
++
++	return 0;
++}
++
++/*
++ * Special node, for STOS and LODS. Fake a displacement of zero on the
++ * destination register.
++ */
++static int
++node_stlo(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	const struct x86_opcode *opcode = instr->opcode;
++	struct x86_store *stlo, *streg;
++	size_t adrsize, regsize;
++
++	adrsize = instr->address_size;
++	regsize = instr->operand_size;
++
++	if (opcode->stos) {
++		streg = &instr->src;
++		stlo = &instr->dst;
++	} else {
++		streg = &instr->dst;
++		stlo = &instr->src;
++	}
++
++	streg->type = STORE_REG;
++	streg->u.reg = &gpr_map[0][0][regsize-1]; /* ?AX */
++
++	stlo->type = STORE_REG;
++	if (opcode->stos) {
++		/* ES:RDI, force ES */
++		stlo->u.reg = &gpr_map__special[1][3][adrsize-1];
++		stlo->hardseg = NVMM_X64_SEG_ES;
++	} else {
++		/* DS:RSI */
++		stlo->u.reg = &gpr_map__special[1][2][adrsize-1];
++	}
++	stlo->disp.type = DISP_0;
++
++	fsm_advance(fsm, 0, NULL);
++
++	return 0;
++}
++
++static int
++node_dmo(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	const struct x86_opcode *opcode = instr->opcode;
++	struct x86_store *stdmo, *streg;
++	size_t adrsize, regsize;
++
++	adrsize = instr->address_size;
++	regsize = instr->operand_size;
++
++	if (opcode->todmo) {
++		streg = &instr->src;
++		stdmo = &instr->dst;
++	} else {
++		streg = &instr->dst;
++		stdmo = &instr->src;
++	}
++
++	streg->type = STORE_REG;
++	streg->u.reg = &gpr_map[0][0][regsize-1]; /* ?AX */
++
++	stdmo->type = STORE_DMO;
++	if (fsm_read(fsm, (uint8_t *)&stdmo->u.dmo, adrsize) == -1) {
++		return -1;
++	}
++	fsm_advance(fsm, adrsize, NULL);
++
++	return 0;
++}
++
++static inline uint64_t
++sign_extend(uint64_t val, int size)
++{
++	if (size == 1) {
++		if (val & __BIT(7))
++			val |= 0xFFFFFFFFFFFFFF00;
++	} else if (size == 2) {
++		if (val & __BIT(15))
++			val |= 0xFFFFFFFFFFFF0000;
++	} else if (size == 4) {
++		if (val & __BIT(31))
++			val |= 0xFFFFFFFF00000000;
++	}
++	return val;
++}
++
++static int
++node_immediate(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	const struct x86_opcode *opcode = instr->opcode;
++	struct x86_store *store;
++	uint8_t immsize;
++	size_t sesize = 0;
++
++	/* The immediate is the source */
++	store = &instr->src;
++	immsize = instr->operand_size;
++
++	if (opcode->flags & FLAG_imm8) {
++		sesize = immsize;
++		immsize = 1;
++	} else if ((opcode->flags & FLAG_immz) && (immsize == 8)) {
++		sesize = immsize;
++		immsize = 4;
++	}
++
++	store->type = STORE_IMM;
++	if (fsm_read(fsm, (uint8_t *)&store->u.imm.data, immsize) == -1) {
++		return -1;
++	}
++	fsm_advance(fsm, immsize, NULL);
++
++	if (sesize != 0) {
++		store->u.imm.data = sign_extend(store->u.imm.data, sesize);
++	}
++
++	return 0;
++}
++
++static int
++node_disp(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	const struct x86_opcode *opcode = instr->opcode;
++	uint64_t data = 0;
++	size_t n;
++
++	if (instr->strm->disp.type == DISP_1) {
++		n = 1;
++	} else if (instr->strm->disp.type == DISP_2) {
++		n = 2;
++	} else if (instr->strm->disp.type == DISP_4) {
++		n = 4;
++	} else {
++		DISASSEMBLER_BUG();
++	}
++
++	if (fsm_read(fsm, (uint8_t *)&data, n) == -1) {
++		return -1;
++	}
++
++	if (fsm->is64bit) {
++		data = sign_extend(data, n);
++	}
++
++	instr->strm->disp.data = data;
++
++	if (opcode->immediate) {
++		fsm_advance(fsm, n, node_immediate);
++	} else {
++		fsm_advance(fsm, n, NULL);
++	}
++
++	return 0;
++}
++
++/*
++ * Special node to handle 16bit addressing encoding, which can reference two
++ * registers at once.
++ */
++static int
++node_dual(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	int reg1, reg2;
++
++	reg1 = gpr_dual_reg1_rm[instr->regmodrm.rm];
++
++	if (instr->regmodrm.rm == 0b000 ||
++	    instr->regmodrm.rm == 0b010) {
++		reg2 = NVMM_X64_GPR_RSI;
++	} else if (instr->regmodrm.rm == 0b001 ||
++	    instr->regmodrm.rm == 0b011) {
++		reg2 = NVMM_X64_GPR_RDI;
++	} else {
++		DISASSEMBLER_BUG();
++	}
++
++	instr->strm->type = STORE_DUALREG;
++	instr->strm->u.dualreg.reg1 = reg1;
++	instr->strm->u.dualreg.reg2 = reg2;
++
++	if (instr->strm->disp.type == DISP_NONE) {
++		DISASSEMBLER_BUG();
++	} else if (instr->strm->disp.type == DISP_0) {
++		/* Indirect register addressing mode */
++		if (instr->opcode->immediate) {
++			fsm_advance(fsm, 1, node_immediate);
++		} else {
++			fsm_advance(fsm, 1, NULL);
++		}
++	} else {
++		fsm_advance(fsm, 1, node_disp);
++	}
++
++	return 0;
++}
++
++static const struct x86_reg *
++get_register_idx(struct x86_instr *instr, uint8_t index)
++{
++	uint8_t enc = index;
++	const struct x86_reg *reg;
++	size_t regsize;
++
++	regsize = instr->address_size;
++	reg = &gpr_map[instr->rexpref.x][enc][regsize-1];
++
++	if (reg->num == -1) {
++		reg = resolve_special_register(instr, enc, regsize);
++	}
++
++	return reg;
++}
++
++static const struct x86_reg *
++get_register_bas(struct x86_instr *instr, uint8_t base)
++{
++	uint8_t enc = base;
++	const struct x86_reg *reg;
++	size_t regsize;
++
++	regsize = instr->address_size;
++	reg = &gpr_map[instr->rexpref.b][enc][regsize-1];
++	if (reg->num == -1) {
++		reg = resolve_special_register(instr, enc, regsize);
++	}
++
++	return reg;
++}
++
++static int
++node_sib(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	const struct x86_opcode *opcode;
++	uint8_t scale, index, base;
++	bool noindex, nobase;
++	uint8_t byte;
++
++	if (fsm_read(fsm, &byte, sizeof(byte)) == -1) {
++		return -1;
++	}
++
++	scale = ((byte & 0b11000000) >> 6);
++	index = ((byte & 0b00111000) >> 3);
++	base  = ((byte & 0b00000111) >> 0);
++
++	opcode = instr->opcode;
++
++	noindex = false;
++	nobase = false;
++
++	if (index == 0b100 && !instr->rexpref.x) {
++		/* Special case: the index is null */
++		noindex = true;
++	}
++
++	if (instr->regmodrm.mod == 0b00 && base == 0b101) {
++		/* Special case: the base is null + disp32 */
++		instr->strm->disp.type = DISP_4;
++		nobase = true;
++	}
++
++	instr->strm->type = STORE_SIB;
++	instr->strm->u.sib.scale = (1 << scale);
++	if (!noindex)
++		instr->strm->u.sib.idx = get_register_idx(instr, index);
++	if (!nobase)
++		instr->strm->u.sib.bas = get_register_bas(instr, base);
++
++	/* May have a displacement, or an immediate */
++	if (instr->strm->disp.type == DISP_1 ||
++	    instr->strm->disp.type == DISP_2 ||
++	    instr->strm->disp.type == DISP_4) {
++		fsm_advance(fsm, 1, node_disp);
++	} else if (opcode->immediate) {
++		fsm_advance(fsm, 1, node_immediate);
++	} else {
++		fsm_advance(fsm, 1, NULL);
++	}
++
++	return 0;
++}
++
++static const struct x86_reg *
++get_register_reg(struct x86_instr *instr, const struct x86_opcode *opcode)
++{
++	uint8_t enc = instr->regmodrm.reg;
++	const struct x86_reg *reg;
++	size_t regsize;
++
++	regsize = instr->operand_size;
++
++	reg = &gpr_map[instr->rexpref.r][enc][regsize-1];
++	if (reg->num == -1) {
++		reg = resolve_special_register(instr, enc, regsize);
++	}
++
++	return reg;
++}
++
++static const struct x86_reg *
++get_register_rm(struct x86_instr *instr, const struct x86_opcode *opcode)
++{
++	uint8_t enc = instr->regmodrm.rm;
++	const struct x86_reg *reg;
++	size_t regsize;
++
++	if (instr->strm->disp.type == DISP_NONE) {
++		regsize = instr->operand_size;
++	} else {
++		/* Indirect access, the size is that of the address. */
++		regsize = instr->address_size;
++	}
++
++	reg = &gpr_map[instr->rexpref.b][enc][regsize-1];
++	if (reg->num == -1) {
++		reg = resolve_special_register(instr, enc, regsize);
++	}
++
++	return reg;
++}
++
++static inline bool
++has_sib(struct x86_instr *instr)
++{
++	return (instr->address_size != 2 && /* no SIB in 16bit addressing */
++	    instr->regmodrm.mod != 0b11 &&
++	    instr->regmodrm.rm == 0b100);
++}
++
++static inline bool
++is_rip_relative(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	return (fsm->is64bit && /* RIP-relative only in 64bit mode */
++	    instr->regmodrm.mod == 0b00 &&
++	    instr->regmodrm.rm == 0b101);
++}
++
++static inline bool
++is_disp32_only(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	return (!fsm->is64bit && /* no disp32-only in 64bit mode */
++	    instr->address_size != 2 && /* no disp32-only in 16bit addressing */
++	    instr->regmodrm.mod == 0b00 &&
++	    instr->regmodrm.rm == 0b101);
++}
++
++static inline bool
++is_disp16_only(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	return (instr->address_size == 2 && /* disp16-only only in 16bit addr */
++	    instr->regmodrm.mod == 0b00 &&
++	    instr->regmodrm.rm == 0b110);
++}
++
++static inline bool
++is_dual(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	return (instr->address_size == 2 &&
++	    instr->regmodrm.mod != 0b11 &&
++	    instr->regmodrm.rm <= 0b011);
++}
++
++static enum x86_disp_type
++get_disp_type(struct x86_instr *instr)
++{
++	switch (instr->regmodrm.mod) {
++	case 0b00:	/* indirect */
++		return DISP_0;
++	case 0b01:	/* indirect+1 */
++		return DISP_1;
++	case 0b10:	/* indirect+{2,4} */
++		if (instr->address_size == 2) {
++			return DISP_2;
++		}
++		return DISP_4;
++	case 0b11:	/* direct */
++	default:	/* llvm */
++		return DISP_NONE;
++	}
++	/* unreachable */
++}
++
++static int
++node_regmodrm(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	struct x86_store *strg, *strm;
++	const struct x86_opcode *opcode;
++	const struct x86_reg *reg;
++	uint8_t byte;
++
++	if (fsm_read(fsm, &byte, sizeof(byte)) == -1) {
++		log_info("%s: fsm_read failure", __func__);
++		return -1;
++	}
++
++	opcode = instr->opcode;
++
++	instr->regmodrm.rm  = ((byte & 0b00000111) >> 0);
++	instr->regmodrm.reg = ((byte & 0b00111000) >> 3);
++	instr->regmodrm.mod = ((byte & 0b11000000) >> 6);
++
++	if (opcode->regtorm) {
++		strg = &instr->src;
++		strm = &instr->dst;
++	} else { /* RM to REG */
++		strm = &instr->src;
++		strg = &instr->dst;
++	}
++
++	/* Save for later use. */
++	instr->strm = strm;
++
++	/*
++	 * Special cases: Groups. The REG field of REGMODRM is the index in
++	 * the group. op1 gets overwritten in the Immediate node, if any.
++	 */
++	if (opcode->group1) {
++		if (group1[instr->regmodrm.reg].emul == NULL) {
++			return -1;
++		}
++		instr->emul = group1[instr->regmodrm.reg].emul;
++	} else if (opcode->group3) {
++		if (group3[instr->regmodrm.reg].emul == NULL) {
++			return -1;
++		}
++		instr->emul = group3[instr->regmodrm.reg].emul;
++	} else if (opcode->group11) {
++		if (group11[instr->regmodrm.reg].emul == NULL) {
++			return -1;
++		}
++		instr->emul = group11[instr->regmodrm.reg].emul;
++	}
++
++	if (!opcode->immediate) {
++		reg = get_register_reg(instr, opcode);
++		if (reg == NULL) {
++			return -1;
++		}
++		strg->type = STORE_REG;
++		strg->u.reg = reg;
++	}
++
++	/* The displacement applies to RM. */
++	strm->disp.type = get_disp_type(instr);
++
++	if (has_sib(instr)) {
++		/* Overwrites RM */
++		fsm_advance(fsm, 1, node_sib);
++		return 0;
++	}
++
++	if (is_rip_relative(fsm, instr)) {
++		/* Overwrites RM */
++		strm->type = STORE_REG;
++		strm->u.reg = &gpr_map__rip;
++		strm->disp.type = DISP_4;
++		fsm_advance(fsm, 1, node_disp);
++		return 0;
++	}
++
++	if (is_disp32_only(fsm, instr)) {
++		/* Overwrites RM */
++		strm->type = STORE_REG;
++		strm->u.reg = NULL;
++		strm->disp.type = DISP_4;
++		fsm_advance(fsm, 1, node_disp);
++		return 0;
++	}
++
++	if (is_disp16_only(fsm, instr)) {
++		/* Overwrites RM */
++		strm->type = STORE_REG;
++		strm->u.reg = NULL;
++		strm->disp.type = DISP_2;
++		fsm_advance(fsm, 1, node_disp);
++		return 0;
++	}
++
++	if (is_dual(fsm, instr)) {
++		/* Overwrites RM */
++		fsm_advance(fsm, 0, node_dual);
++		return 0;
++	}
++
++	reg = get_register_rm(instr, opcode);
++	if (reg == NULL) {
++		return -1;
++	}
++	strm->type = STORE_REG;
++	strm->u.reg = reg;
++
++	if (strm->disp.type == DISP_NONE) {
++		/* Direct register addressing mode */
++		if (opcode->immediate) {
++			fsm_advance(fsm, 1, node_immediate);
++		} else {
++			fsm_advance(fsm, 1, NULL);
++		}
++	} else if (strm->disp.type == DISP_0) {
++		/* Indirect register addressing mode */
++		if (opcode->immediate) {
++			fsm_advance(fsm, 1, node_immediate);
++		} else {
++			fsm_advance(fsm, 1, NULL);
++		}
++	} else {
++		fsm_advance(fsm, 1, node_disp);
++	}
++
++	return 0;
++}
++
++static size_t
++get_operand_size(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	const struct x86_opcode *opcode = instr->opcode;
++	int opsize;
++
++	/* Get the opsize */
++	if (!opcode->szoverride) {
++		opsize = opcode->defsize;
++	} else if (instr->rexpref.present && instr->rexpref.w) {
++		opsize = 8;
++	} else {
++		if (!fsm->is16bit) {
++			if (instr->legpref.opr_ovr) {
++				opsize = 2;
++			} else {
++				opsize = 4;
++			}
++		} else { /* 16bit */
++			if (instr->legpref.opr_ovr) {
++				opsize = 4;
++			} else {
++				opsize = 2;
++			}
++		}
++	}
++
++	return opsize;
++}
++
++static size_t
++get_address_size(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	if (fsm->is64bit) {
++		if (instr->legpref.adr_ovr) {
++			return 4;
++		}
++		return 8;
++	}
++
++	if (fsm->is32bit) {
++		if (instr->legpref.adr_ovr) {
++			return 2;
++		}
++		return 4;
++	}
++
++	/* 16bit. */
++	if (instr->legpref.adr_ovr) {
++		return 4;
++	}
++	return 2;
++}
++
++static int
++node_primary_opcode(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	const struct x86_opcode *opcode;
++	uint8_t byte;
++
++	if (fsm_read(fsm, &byte, sizeof(byte)) == -1) {
++		log_info("%s: fsm_read failure", __func__);
++		return -1;
++	}
++
++	opcode = &primary_opcode_table[byte];
++	if (!opcode->valid) {
++		log_info("%s: invalid opcode!", __func__);
++		return -1;
++	}
++
++	instr->opcode = opcode;
++	instr->emul = opcode->emul;
++	instr->operand_size = get_operand_size(fsm, instr);
++	instr->address_size = get_address_size(fsm, instr);
++
++	if (fsm->is64bit && (instr->operand_size == 4)) {
++		/* Zero-extend to 64 bits. */
++		instr->zeroextend_mask = ~size_to_mask(4);
++	}
++
++	if (opcode->regmodrm) {
++		fsm_advance(fsm, 1, node_regmodrm);
++	} else if (opcode->dmo) {
++		/* Direct-Memory Offsets */
++		fsm_advance(fsm, 1, node_dmo);
++	} else if (opcode->stos || opcode->lods) {
++		fsm_advance(fsm, 1, node_stlo);
++	} else if (opcode->movs) {
++		fsm_advance(fsm, 1, node_movs);
++	} else if (opcode->cmps) {
++		fsm_advance(fsm, 1, node_cmps);
++	} else {
++		log_info("%s: sadness", __func__);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int
++node_secondary_opcode(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	const struct x86_opcode *opcode;
++	uint8_t byte;
++
++	if (fsm_read(fsm, &byte, sizeof(byte)) == -1) {
++		return -1;
++	}
++
++	opcode = &secondary_opcode_table[byte];
++	if (!opcode->valid) {
++		return -1;
++	}
++
++	instr->opcode = opcode;
++	instr->emul = opcode->emul;
++	instr->operand_size = get_operand_size(fsm, instr);
++	instr->address_size = get_address_size(fsm, instr);
++
++	if (fsm->is64bit && (instr->operand_size == 4)) {
++		/* Zero-extend to 64 bits. */
++		instr->zeroextend_mask = ~size_to_mask(4);
++	}
++
++	if (opcode->flags & FLAG_ze) {
++		/*
++		 * Compute the mask for zero-extend. Update the operand size,
++		 * we move fewer bytes.
++		 */
++		instr->zeroextend_mask |= size_to_mask(instr->operand_size);
++		instr->zeroextend_mask &= ~size_to_mask(opcode->defsize);
++		instr->operand_size = opcode->defsize;
++	}
++
++	if (opcode->regmodrm) {
++		fsm_advance(fsm, 1, node_regmodrm);
++	} else {
++		return -1;
++	}
++
++	return 0;
++}
++
++static int
++node_main(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	uint8_t byte;
++
++#define ESCAPE	0x0F
++#define VEX_1	0xC5
++#define VEX_2	0xC4
++#define XOP	0x8F
++
++	if (fsm_read(fsm, &byte, sizeof(byte)) == -1) {
++		log_info("%s: read failure", __func__);
++		return -1;
++	}
++
++	/*
++	 * We don't take XOP. It is AMD-specific, and it was removed shortly
++	 * after being introduced.
++	 */
++	if (byte == ESCAPE) {
++		fsm_advance(fsm, 1, node_secondary_opcode);
++	} else if (!instr->rexpref.present) {
++		if (byte == VEX_1) {
++			log_warn("%s: VEX_1", __func__);
++			return -1;
++		} else if (byte == VEX_2) {
++			log_warn("%s: VEX_2", __func__);
++			return -1;
++		} else {
++			fsm->fn = node_primary_opcode;
++		}
++	} else {
++		fsm->fn = node_primary_opcode;
++	}
++
++	return 0;
++}
++
++static int
++node_rex_prefix(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	struct x86_rexpref *rexpref = &instr->rexpref;
++	uint8_t byte;
++	size_t n = 0;
++
++	if (fsm_read(fsm, &byte, sizeof(byte)) == -1) {
++		log_info("%s: read failure", __func__);
++		return -1;
++	}
++
++	if (byte >= 0x40 && byte <= 0x4F) {
++		if (!fsm->is64bit) {
++			log_info("%s: not 64 bit?!", __func__);
++			return -1;
++		}
++		rexpref->b = ((byte & 0x1) != 0);
++		rexpref->x = ((byte & 0x2) != 0);
++		rexpref->r = ((byte & 0x4) != 0);
++		rexpref->w = ((byte & 0x8) != 0);
++		rexpref->present = true;
++		n = 1;
++	}
++
++	fsm_advance(fsm, n, node_main);
++	return 0;
++}
++
++static int
++node_legacy_prefix(struct x86_decode_fsm *fsm, struct x86_instr *instr)
++{
++	uint8_t byte;
++
++	if (fsm_read(fsm, &byte, sizeof(byte)) == -1) {
++		log_info("%s: fsm_read failure", __func__);
++		return -1;
++	}
++
++	log_info("%s: read byte 0x%X", __func__, byte);
++
++	if (byte == LEG_OPR_OVR) {
++		instr->legpref.opr_ovr = 1;
++	} else if (byte == LEG_OVR_DS) {
++		instr->legpref.seg = NVMM_X64_SEG_DS;
++	} else if (byte == LEG_OVR_ES) {
++		instr->legpref.seg = NVMM_X64_SEG_ES;
++	} else if (byte == LEG_REP) {
++		instr->legpref.rep = 1;
++	} else if (byte == LEG_OVR_GS) {
++		instr->legpref.seg = NVMM_X64_SEG_GS;
++	} else if (byte == LEG_OVR_FS) {
++		instr->legpref.seg = NVMM_X64_SEG_FS;
++	} else if (byte == LEG_ADR_OVR) {
++		instr->legpref.adr_ovr = 1;
++	} else if (byte == LEG_OVR_CS) {
++		instr->legpref.seg = NVMM_X64_SEG_CS;
++	} else if (byte == LEG_OVR_SS) {
++		instr->legpref.seg = NVMM_X64_SEG_SS;
++	} else if (byte == LEG_REPN) {
++		instr->legpref.repn = 1;
++	} else if (byte == LEG_LOCK) {
++		/* ignore */
++	} else {
++		log_info("%s: not legacy, using node_rex_prefix", __func__);
++		/* not a legacy prefix */
++		fsm_advance(fsm, 0, node_rex_prefix);
++		return 0;
++	}
++
++	fsm_advance(fsm, 1, node_legacy_prefix);
++	return 0;
++}
++
++/* -------------------------------------------------------------------------- */
++
++#define EXEC_INSTR(sz, instr)						\
++static uint##sz##_t							\
++exec_##instr##sz(uint##sz##_t op1, uint##sz##_t op2, uint64_t *rflags)	\
++{									\
++	uint##sz##_t res;						\
++	__asm __volatile (						\
++		#instr"	%2, %3;"					\
++		"mov	%3, %1;"					\
++		"pushfq;"						\
++		"popq	%0"						\
++	    : "=r" (*rflags), "=r" (res)				\
++	    : "r" (op1), "r" (op2));					\
++	return res;							\
++}
++
++#define EXEC_DISPATCHER(instr)						\
++static uint64_t								\
++exec_##instr(uint64_t op1, uint64_t op2, uint64_t *rflags, size_t opsize) \
++{									\
++	switch (opsize) {						\
++	case 1:								\
++		return exec_##instr##8(op1, op2, rflags);		\
++	case 2:								\
++		return exec_##instr##16(op1, op2, rflags);		\
++	case 4:								\
++		return exec_##instr##32(op1, op2, rflags);		\
++	default:							\
++		return exec_##instr##64(op1, op2, rflags);		\
++	}								\
++}
++
++/* SUB: ret = op1 - op2 */
++#define PSL_SUB_MASK	(PSL_V|PSL_C|PSL_Z|PSL_N|PSL_PF|PSL_AF)
++EXEC_INSTR(8, sub)
++EXEC_INSTR(16, sub)
++EXEC_INSTR(32, sub)
++EXEC_INSTR(64, sub)
++EXEC_DISPATCHER(sub)
++
++/* OR:  ret = op1 | op2 */
++#define PSL_OR_MASK	(PSL_V|PSL_C|PSL_Z|PSL_N|PSL_PF)
++EXEC_INSTR(8, or)
++EXEC_INSTR(16, or)
++EXEC_INSTR(32, or)
++EXEC_INSTR(64, or)
++EXEC_DISPATCHER(or)
++
++/* AND: ret = op1 & op2 */
++#define PSL_AND_MASK	(PSL_V|PSL_C|PSL_Z|PSL_N|PSL_PF)
++EXEC_INSTR(8, and)
++EXEC_INSTR(16, and)
++EXEC_INSTR(32, and)
++EXEC_INSTR(64, and)
++EXEC_DISPATCHER(and)
++
++/* XOR: ret = op1 ^ op2 */
++#define PSL_XOR_MASK	(PSL_V|PSL_C|PSL_Z|PSL_N|PSL_PF)
++EXEC_INSTR(8, xor)
++EXEC_INSTR(16, xor)
++EXEC_INSTR(32, xor)
++EXEC_INSTR(64, xor)
++EXEC_DISPATCHER(xor)
++
++
++/* -------------------------------------------------------------------------- */
++
++/*
++ * Emulation functions. We don't care about the order of the operands, except
++ * for SUB, CMP and TEST. For these ones we look at mem->write to determine who
++ * is op1 and who is op2.
++ */
++
++static void
++x86_func_or(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	uint64_t *retval = (uint64_t *)mem->data;
++	const bool write = mem->write;
++	uint64_t *op1, op2, fl, ret;
++
++	op1 = (uint64_t *)mem->data;
++	op2 = 0;
++
++	/* Fetch the value to be OR'ed (op2). */
++	mem->data = (uint8_t *)&op2;
++	mem->write = false;
++	(*vcpu->cbs.mem)(mem);
++
++	/* Perform the OR. */
++	ret = exec_or(*op1, op2, &fl, mem->size);
++
++	if (write) {
++		/* Write back the result. */
++		mem->data = (uint8_t *)&ret;
++		mem->write = true;
++		(*vcpu->cbs.mem)(mem);
++	} else {
++		/* Return data to the caller. */
++		*retval = ret;
++	}
++
++	gprs[NVMM_X64_GPR_RFLAGS] &= ~PSL_OR_MASK;
++	gprs[NVMM_X64_GPR_RFLAGS] |= (fl & PSL_OR_MASK);
++}
++
++static void
++x86_func_and(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	uint64_t *retval = (uint64_t *)mem->data;
++	const bool write = mem->write;
++	uint64_t *op1, op2, fl, ret;
++
++	op1 = (uint64_t *)mem->data;
++	op2 = 0;
++
++	/* Fetch the value to be AND'ed (op2). */
++	mem->data = (uint8_t *)&op2;
++	mem->write = false;
++	(*vcpu->cbs.mem)(mem);
++
++	/* Perform the AND. */
++	ret = exec_and(*op1, op2, &fl, mem->size);
++
++	if (write) {
++		/* Write back the result. */
++		mem->data = (uint8_t *)&ret;
++		mem->write = true;
++		(*vcpu->cbs.mem)(mem);
++	} else {
++		/* Return data to the caller. */
++		*retval = ret;
++	}
++
++	gprs[NVMM_X64_GPR_RFLAGS] &= ~PSL_AND_MASK;
++	gprs[NVMM_X64_GPR_RFLAGS] |= (fl & PSL_AND_MASK);
++}
++
++static void
++x86_func_xchg(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	uint64_t *op1, op2;
++
++	op1 = (uint64_t *)mem->data;
++	op2 = 0;
++
++	/* Fetch op2. */
++	mem->data = (uint8_t *)&op2;
++	mem->write = false;
++	(*vcpu->cbs.mem)(mem);
++
++	/* Write op1 in op2. */
++	mem->data = (uint8_t *)op1;
++	mem->write = true;
++	(*vcpu->cbs.mem)(mem);
++
++	/* Write op2 in op1. */
++	*op1 = op2;
++}
++
++static void
++x86_func_sub(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	uint64_t *retval = (uint64_t *)mem->data;
++	const bool write = mem->write;
++	uint64_t *op1, *op2, fl, ret;
++	uint64_t tmp;
++	bool memop1;
++
++	memop1 = !mem->write;
++	op1 = memop1 ? &tmp : (uint64_t *)mem->data;
++	op2 = memop1 ? (uint64_t *)mem->data : &tmp;
++
++	/* Fetch the value to be SUB'ed (op1 or op2). */
++	mem->data = (uint8_t *)&tmp;
++	mem->write = false;
++	(*vcpu->cbs.mem)(mem);
++
++	/* Perform the SUB. */
++	ret = exec_sub(*op1, *op2, &fl, mem->size);
++
++	if (write) {
++		/* Write back the result. */
++		mem->data = (uint8_t *)&ret;
++		mem->write = true;
++		(*vcpu->cbs.mem)(mem);
++	} else {
++		/* Return data to the caller. */
++		*retval = ret;
++	}
++
++	gprs[NVMM_X64_GPR_RFLAGS] &= ~PSL_SUB_MASK;
++	gprs[NVMM_X64_GPR_RFLAGS] |= (fl & PSL_SUB_MASK);
++}
++
++static void
++x86_func_xor(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	uint64_t *retval = (uint64_t *)mem->data;
++	const bool write = mem->write;
++	uint64_t *op1, op2, fl, ret;
++
++	op1 = (uint64_t *)mem->data;
++	op2 = 0;
++
++	/* Fetch the value to be XOR'ed (op2). */
++	mem->data = (uint8_t *)&op2;
++	mem->write = false;
++	(*vcpu->cbs.mem)(mem);
++
++	/* Perform the XOR. */
++	ret = exec_xor(*op1, op2, &fl, mem->size);
++
++	if (write) {
++		/* Write back the result. */
++		mem->data = (uint8_t *)&ret;
++		mem->write = true;
++		(*vcpu->cbs.mem)(mem);
++	} else {
++		/* Return data to the caller. */
++		*retval = ret;
++	}
++
++	gprs[NVMM_X64_GPR_RFLAGS] &= ~PSL_XOR_MASK;
++	gprs[NVMM_X64_GPR_RFLAGS] |= (fl & PSL_XOR_MASK);
++}
++
++static void
++x86_func_cmp(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	uint64_t *op1, *op2, fl;
++	uint64_t tmp;
++	bool memop1;
++
++	memop1 = !mem->write;
++	op1 = memop1 ? &tmp : (uint64_t *)mem->data;
++	op2 = memop1 ? (uint64_t *)mem->data : &tmp;
++
++	/* Fetch the value to be CMP'ed (op1 or op2). */
++	mem->data = (uint8_t *)&tmp;
++	mem->write = false;
++	(*vcpu->cbs.mem)(mem);
++
++	/* Perform the CMP. */
++	exec_sub(*op1, *op2, &fl, mem->size);
++
++	gprs[NVMM_X64_GPR_RFLAGS] &= ~PSL_SUB_MASK;
++	gprs[NVMM_X64_GPR_RFLAGS] |= (fl & PSL_SUB_MASK);
++}
++
++static void
++x86_func_test(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	uint64_t *op1, *op2, fl;
++	uint64_t tmp;
++	bool memop1;
++
++	memop1 = !mem->write;
++	op1 = memop1 ? &tmp : (uint64_t *)mem->data;
++	op2 = memop1 ? (uint64_t *)mem->data : &tmp;
++
++	/* Fetch the value to be TEST'ed (op1 or op2). */
++	mem->data = (uint8_t *)&tmp;
++	mem->write = false;
++	(*vcpu->cbs.mem)(mem);
++
++	/* Perform the TEST. */
++	exec_and(*op1, *op2, &fl, mem->size);
++
++	gprs[NVMM_X64_GPR_RFLAGS] &= ~PSL_AND_MASK;
++	gprs[NVMM_X64_GPR_RFLAGS] |= (fl & PSL_AND_MASK);
++}
++
++static void
++x86_func_mov(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	/*
++	 * Nothing special, just move without emulation.
++	 */
++	(*vcpu->cbs.mem)(mem);
++}
++
++static void
++x86_func_stos(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	/*
++	 * Just move, and update RDI.
++	 */
++	(*vcpu->cbs.mem)(mem);
++
++	if (gprs[NVMM_X64_GPR_RFLAGS] & PSL_D) {
++		gprs[NVMM_X64_GPR_RDI] -= mem->size;
++	} else {
++		gprs[NVMM_X64_GPR_RDI] += mem->size;
++	}
++}
++
++static void
++x86_func_lods(struct nvmm_vcpu *vcpu, struct nvmm_mem *mem, uint64_t *gprs)
++{
++	/*
++	 * Just move, and update RSI.
++	 */
++	(*vcpu->cbs.mem)(mem);
++
++	if (gprs[NVMM_X64_GPR_RFLAGS] & PSL_D) {
++		gprs[NVMM_X64_GPR_RSI] -= mem->size;
++	} else {
++		gprs[NVMM_X64_GPR_RSI] += mem->size;
++	}
++}
++
++/* -------------------------------------------------------------------------- */
++
++/* -------------------------------------------------------------------------- */
++/*
++ * The following is modified to adapt to vmd(8).
++ *
++ */
++
++/*
++static inline bool
++is_64bit(struct vcpu_reg_state *state)
++{
++	return (state->segs[NVMM_X64_SEG_CS].attrib.l != 0);
++}
++
++static inline bool
++is_32bit(struct nvmm_x64_state *state)
++{
++	return (state->segs[NVMM_X64_SEG_CS].attrib.l == 0) &&
++	    (state->segs[NVMM_X64_SEG_CS].attrib.def == 1);
++}
++
++static inline bool
++is_16bit(struct nvmm_x64_state *state)
++{
++	return (state->segs[NVMM_X64_SEG_CS].attrib.l == 0) &&
++	    (state->segs[NVMM_X64_SEG_CS].attrib.def == 0);
++}
++*/
++
++static inline bool
++is_long_mode(struct vcpu_reg_state *vrs)
++{
++	return (vrs->vrs_msrs[VCPU_REGS_EFER] & EFER_LMA) != 0;
++}
++
++
++static int
++read_guest_memory(struct vm_exit *exit, gvaddr_t gva, uint8_t *data,
++    size_t size)
++{
++	int ret, remain;
++	uint64_t gpa;
++
++	ret = translate_gva(exit, gva, &gpa, PROT_READ);
++	if (ret != 0) {
++		return (ret);
++	}
++
++	if ((gva & PAGE_MASK) + size > PAGE_SIZE)
++		remain = ((gva & PAGE_MASK) + size - PAGE_SIZE);
++	else
++		remain = 0;
++
++	size -= remain;
++
++	ret = read_mem(gpa, data, size);
++
++	return (ret);
++}
++
++static int
++fetch_instruction(struct vm_exit *ve)
++{
++	struct vcpu_reg_state state = ve->vrs;
++	size_t fetchsize = ve->vee.insn_len;
++	gvaddr_t gva;
++	int ret;
++
++	fetchsize = sizeof(ve->vee.insn_bytes);
++
++	gva = state.vrs_gprs[VCPU_REGS_RIP];
++	if (!is_long_mode(&state)) {
++		printf("%s: long mode not supported!\n", __func__);
++/*
++		ret = segment_check(&state->segs[NVMM_X64_SEG_CS], gva,
++		    fetchsize);
++		if (ret == -1)
++			return -1;
++		segment_apply(&state->segs[NVMM_X64_SEG_CS], &gva);
++*/
++	}
++
++	ret = read_guest_memory(ve, gva, ve->vee.insn_bytes, fetchsize);
++	if (ret == -1)
++		return -1;
++
++	ve->vee.insn_len = fetchsize;
++
++	return 0;
++}
++
++static int
++x86_decode(uint8_t *inst_bytes, size_t inst_len, struct x86_instr *instr)
++{
++	struct x86_decode_fsm fsm;
++	int ret;
++
++	memset(instr, 0, sizeof(*instr));
++	instr->legpref.seg = -1;
++	instr->src.hardseg = -1;
++	instr->dst.hardseg = -1;
++/*
++	fsm.is64bit = is_64bit(state);
++	fsm.is32bit = is_32bit(state);
++	fsm.is16bit = is_16bit(state);
++*/
++	fsm.is64bit = true;
++	fsm.is32bit = false;
++	fsm.is16bit = false;
++
++	fsm.fn = node_legacy_prefix;
++	fsm.buf = inst_bytes;
++	fsm.end = inst_bytes + inst_len;
++
++	while (fsm.fn != NULL) {
++		ret = (*fsm.fn)(&fsm, instr);
++		if (ret == -1) {
++			printf("%s debug: unrecognized instruction found "
++			       "with max length %lu : [ ", __func__, inst_len);
++			for (uint i = 0; i < inst_len; i++)
++			      printf("%02x ", inst_bytes[i]);
++			printf("]\n");
++			fflush(stdout);
++			return -1;
++		}
++	}
++
++	instr->len = fsm.buf - inst_bytes;
++
++	return 0;
++}
++
++/* -------------------------------------------------------------------------- */
++
++int
++assist_mmio(struct vm_exit *ve)
++{
++	struct x86_instr instr;
++	int ret;
++
++	memset(&instr, 0, sizeof(struct x86_instr));
++
++	if ((ret = fetch_instruction(ve)) != 0) {
++		log_warn("%s: fetch instruction failed (%d)", __func__, ret);
++		return (ret);
++	}
++
++	ret = x86_decode(ve->vee.insn_bytes, ve->vee.insn_len, &instr);
++	if (ret != 0) {
++		log_warn("%s: failed x86 decode", __func__);
++	}
++
++	if (instr.opcode->movs) {
++		log_info("%s: opcode is a MOV", __func__);
++	} else if (instr.opcode->cmps) {
++		log_info("%s: opcode is a CMP", __func__);
++	} else {
++		log_info("%s: opcode is a SINGLE", __func__);
++		switch(instr.src.type) {
++		case STORE_REG:
++			log_info("-- STORE_REG");
++			log_info("--- src.disp.type: %d", instr.src.disp.type);
++			break;
++		case STORE_DUALREG:
++			log_info("-- STORE_DUALREG");
++			break;
++		case STORE_IMM:
++			log_info("-- STORE_IMM");
++			break;
++		case STORE_SIB:
++			log_info("-- STORE_SIG");
++			break;
++		case STORE_DMO:
++			log_info("-- STORE_DMO");
++			break;
++		case STORE_NONE:
++			log_info("-- STORE_NONE");
++			break;
++		}
++
++	}
++
++	return (0);
++}
+Index: usr.sbin/vmd/mmio.h
+===================================================================
+RCS file: usr.sbin/vmd/mmio.h
+diff -N usr.sbin/vmd/mmio.h
+--- /dev/null	1 Jan 1970 00:00:00 -0000
++++ usr.sbin/vmd/mmio.h	16 Mar 2021 12:07:47 -0000
+@@ -0,0 +1,238 @@
++#include <sys/types.h>
++
++#ifndef _MMIO_
++#define _MMIO_
++
++#define __BIT(bit) ((uint64_t) 1 << bit)
++
++typedef uint64_t	gpaddr_t;
++typedef uint64_t	gvaddr_t;
++
++
++/* -------------------------------------------------------------------------- */
++/*	$NetBSD: libnvmm_x86.c,v 1.43 2020/12/27 20:56:14 reinoud Exp $	*/
++
++/*
++ * Copyright (c) 2018-2020 Maxime Villard, m00nbsd.net
++ * All rights reserved.
++ *
++ * This code is part of the NVMM hypervisor.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++//// nvmm_x86.h
++
++
++/*
++ * Segment state indexes. We use X64 as naming convention, not to confuse with
++ * X86 which originally implied 32bit.
++ */
++
++/* Segments. */
++#define NVMM_X64_SEG_ES			0
++#define NVMM_X64_SEG_CS			1
++#define NVMM_X64_SEG_SS			2
++#define NVMM_X64_SEG_DS			3
++#define NVMM_X64_SEG_FS			4
++#define NVMM_X64_SEG_GS			5
++#define NVMM_X64_SEG_GDT		6
++#define NVMM_X64_SEG_IDT		7
++#define NVMM_X64_SEG_LDT		8
++#define NVMM_X64_SEG_TR			9
++#define NVMM_X64_NSEG			10
++
++/* General Purpose Registers. */
++#define NVMM_X64_GPR_RAX		0
++#define NVMM_X64_GPR_RCX		1
++#define NVMM_X64_GPR_RDX		2
++#define NVMM_X64_GPR_RBX		3
++#define NVMM_X64_GPR_RSP		4
++#define NVMM_X64_GPR_RBP		5
++#define NVMM_X64_GPR_RSI		6
++#define NVMM_X64_GPR_RDI		7
++#define NVMM_X64_GPR_R8			8
++#define NVMM_X64_GPR_R9			9
++#define NVMM_X64_GPR_R10		10
++#define NVMM_X64_GPR_R11		11
++#define NVMM_X64_GPR_R12		12
++#define NVMM_X64_GPR_R13		13
++#define NVMM_X64_GPR_R14		14
++#define NVMM_X64_GPR_R15		15
++#define NVMM_X64_GPR_RIP		16
++#define NVMM_X64_GPR_RFLAGS		17
++#define NVMM_X64_NGPR			18
++
++/* Control Registers. */
++#define NVMM_X64_CR_CR0			0
++#define NVMM_X64_CR_CR2			1
++#define NVMM_X64_CR_CR3			2
++#define NVMM_X64_CR_CR4			3
++#define NVMM_X64_CR_CR8			4
++#define NVMM_X64_CR_XCR0		5
++#define NVMM_X64_NCR			6
++
++/* Debug Registers. */
++#define NVMM_X64_DR_DR0			0
++#define NVMM_X64_DR_DR1			1
++#define NVMM_X64_DR_DR2			2
++#define NVMM_X64_DR_DR3			3
++#define NVMM_X64_DR_DR6			4
++#define NVMM_X64_DR_DR7			5
++#define NVMM_X64_NDR			6
++
++/* MSRs. */
++#define NVMM_X64_MSR_EFER		0
++#define NVMM_X64_MSR_STAR		1
++#define NVMM_X64_MSR_LSTAR		2
++#define NVMM_X64_MSR_CSTAR		3
++#define NVMM_X64_MSR_SFMASK		4
++#define NVMM_X64_MSR_KERNELGSBASE	5
++#define NVMM_X64_MSR_SYSENTER_CS	6
++#define NVMM_X64_MSR_SYSENTER_ESP	7
++#define NVMM_X64_MSR_SYSENTER_EIP	8
++#define NVMM_X64_MSR_PAT		9
++#define NVMM_X64_MSR_TSC		10
++#define NVMM_X64_NMSR			11
++
++#define NVMM_VCPU_EVENT_EXCP	0
++#define NVMM_VCPU_EVENT_INTR	1
++
++struct nvmm_x86_event {
++	u_int type;
++	uint8_t vector;
++	union {
++		struct {
++			uint64_t error;
++		} excp;
++	} u;
++};
++
++struct nvmm_x64_state_seg {
++	uint16_t selector;
++	struct {		/* hidden */
++		uint16_t type:4;
++		uint16_t s:1;
++		uint16_t dpl:2;
++		uint16_t p:1;
++		uint16_t avl:1;
++		uint16_t l:1;
++		uint16_t def:1;
++		uint16_t g:1;
++		uint16_t rsvd:4;
++	} attrib;
++	uint32_t limit;		/* hidden */
++	uint64_t base;		/* hidden */
++};
++
++struct nvmm_x64_state_intr {
++	uint64_t int_shadow:1;
++	uint64_t int_window_exiting:1;
++	uint64_t nmi_window_exiting:1;
++	uint64_t evt_pending:1;
++	uint64_t rsvd:60;
++};
++
++/* Flags. */
++#define NVMM_X64_STATE_SEGS	0x01
++#define NVMM_X64_STATE_GPRS	0x02
++#define NVMM_X64_STATE_CRS	0x04
++#define NVMM_X64_STATE_DRS	0x08
++#define NVMM_X64_STATE_MSRS	0x10
++#define NVMM_X64_STATE_INTR	0x20
++#define NVMM_X64_STATE_FPU	0x40
++#define NVMM_X64_STATE_ALL	\
++	(NVMM_X64_STATE_SEGS | NVMM_X64_STATE_GPRS | NVMM_X64_STATE_CRS | \
++	 NVMM_X64_STATE_DRS | NVMM_X64_STATE_MSRS | NVMM_X64_STATE_INTR | \
++	 NVMM_X64_STATE_FPU)
++
++struct nvmm_x64_state {
++	struct nvmm_x64_state_seg segs[NVMM_X64_NSEG];
++	uint64_t gprs[NVMM_X64_NGPR];
++	uint64_t crs[NVMM_X64_NCR];
++	uint64_t drs[NVMM_X64_NDR];
++	uint64_t msrs[NVMM_X64_NMSR];
++	struct nvmm_x64_state_intr intr;
++//	struct fxsave fpu;
++};
++
++#define nvmm_vcpu_exit		nvmm_x86_exit
++#define nvmm_vcpu_event		nvmm_x86_event
++#define nvmm_vcpu_state		nvmm_x64_state
++
++//// libnvmm/nvmm.h
++
++typedef uint32_t	nvmm_machid_t;
++typedef uint32_t	nvmm_cpuid_t;
++
++struct nvmm_io;
++struct nvmm_mem;
++
++struct nvmm_comm_page {
++	/* State. */
++	uint64_t state_wanted;
++	uint64_t state_cached;
++	uint64_t state_commit;
++	struct nvmm_vcpu_state state;
++
++	/* Event. */
++	bool event_commit;
++	struct nvmm_vcpu_event event;
++};
++
++struct nvmm_assist_callbacks {
++	void (*io)(struct nvmm_io *);
++	void (*mem)(struct nvmm_mem *);
++};
++
++struct nvmm_machine {
++	nvmm_machid_t machid;
++	struct nvmm_comm_page **pages;
++	void *areas; /* opaque */
++};
++
++struct nvmm_vcpu {
++	nvmm_cpuid_t cpuid;
++	struct nvmm_assist_callbacks cbs;
++	struct nvmm_vcpu_state *state;
++	struct nvmm_vcpu_event *event;
++	struct nvmm_vcpu_exit *exit;
++};
++
++struct nvmm_io {
++	struct nvmm_machine *mach;
++	struct nvmm_vcpu *vcpu;
++	uint16_t port;
++	bool in;
++	size_t size;
++	uint8_t *data;
++};
++
++struct nvmm_mem {
++	struct nvmm_machine *mach;
++	struct nvmm_vcpu *vcpu;
++	gpaddr_t gpa;
++	bool write;
++	size_t size;
++	uint8_t *data;
++};
++#endif /* _NVMM_X86_H_ */
+Index: usr.sbin/vmd/vm.c
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vm.c,v
+retrieving revision 1.59
+diff -u -p -u -p -r1.59 vm.c
+--- usr.sbin/vmd/vm.c	13 Feb 2021 07:56:26 -0000	1.59
++++ usr.sbin/vmd/vm.c	16 Mar 2021 12:07:47 -0000
+@@ -1594,6 +1594,21 @@ vcpu_exit_inout(struct vm_run_params *vr
+ 		vcpu_assert_pic_irq(vrp->vrp_vm_id, vrp->vrp_vcpu_id, intr);
+ }
+ 
++static const char*
++mem_exit_type(int fault_type)
++{
++	switch(fault_type) {
++	case VEE_FAULT_REGULAR:
++		return "VEE_FAULT_REGULAR";
++	case VEE_FAULT_PROTECT:
++		return "VEE_FAULT_PROTECT";
++	case VEE_MMIO_ASSIST:
++		return "VEE_MMIO_ASSIST";
++	default:
++		return "UNSUPPORTED";
++	}
++}
++
+ /*
+  * vcpu_exit_eptviolation
+  *
+@@ -1610,6 +1625,13 @@ int
+ vcpu_exit_eptviolation(struct vm_run_params *vrp)
+ {
+ 	struct vm_exit *ve = vrp->vrp_exit;
++	paddr_t gpa = ve->vee.gpa;
++	uint8_t insn_len = ve->vee.insn_len;
++	int ret;
++
++	log_debug("%s: type=%s, gpa=0x%lx, rip=0x%llx, insn_len=%hhu",
++	    __func__, mem_exit_type(ve->vee.vee_fault_type), gpa,
++	    ve->vrs.vrs_gprs[VCPU_REGS_RIP], insn_len);
+ 
+ 	/*
+ 	 * vmd may be exiting to vmd to handle a pending interrupt
+@@ -1617,10 +1639,24 @@ vcpu_exit_eptviolation(struct vm_run_par
+ 	 * check the fault_type to ensure we really are processing
+ 	 * a VMX_EXIT_EPT_VIOLATION.
+ 	 */
+-	if (ve->vee.vee_fault_type == VEE_FAULT_PROTECT) {
++	switch (ve->vee.vee_fault_type) {
++	case VEE_FAULT_PROTECT:
+ 		log_debug("%s: EPT Violation: rip=0x%llx",
+-		    __progname, vrp->vrp_exit->vrs.vrs_gprs[VCPU_REGS_RIP]);
++		    __progname, ve->vrs.vrs_gprs[VCPU_REGS_RIP]);
+ 		return (EAGAIN);
++	case VEE_MMIO_ASSIST:
++		log_info("%s: MMIO Assist", __progname);
++		if ((ret = assist_mmio(ve)) != 0) {
++			log_info("%s: mmio failure (%d)", __progname, ret);
++		} else {
++			log_info("%s: mmio success!!!", __progname);
++		}
++		break;
++	case VEE_FAULT_REGULAR:
++		// regular ept fault
++		break;
++	default:
++		fatal("unsupported ept exit fault type!");
+ 	}
+ 
+ 	return (0);
+Index: usr.sbin/vmd/vmd.h
+===================================================================
+RCS file: /cvs/src/usr.sbin/vmd/vmd.h,v
+retrieving revision 1.101
+diff -u -p -u -p -r1.101 vmd.h
+--- usr.sbin/vmd/vmd.h	23 Sep 2020 19:18:18 -0000	1.101
++++ usr.sbin/vmd/vmd.h	16 Mar 2021 12:07:47 -0000
+@@ -460,6 +460,7 @@ __dead void vm_shutdown(unsigned int);
+ void	 vm_pipe_init(struct vm_dev_pipe *, void (*)(int, short, void *));
+ void	 vm_pipe_send(struct vm_dev_pipe *, enum pipe_msg_type);
+ enum pipe_msg_type vm_pipe_recv(struct vm_dev_pipe *);
++int	 translate_gva(struct vm_exit*, uint64_t, uint64_t*, int);
+ 
+ /* control.c */
+ int	 config_init(struct vmd *);
+@@ -485,5 +486,8 @@ int	 host(const char *, struct address *
+ 
+ /* virtio.c */
+ int	 virtio_get_base(int, char *, size_t, int, const char *);
++
++/* mmio.c */
++int	 assist_mmio(struct vm_exit*);
+ 
+ #endif /* VMD_H */
